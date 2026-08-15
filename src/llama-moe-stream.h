@@ -73,7 +73,7 @@ struct llama_moe_stream_layer {
     // residency state, guarded by mgr->mtx
     std::vector<int32_t>                 slot_expert;   // [n_slots] expert id or -1
     std::vector<uint8_t>                 slot_state;    // [n_slots] llama_moe_stream_slot_state
-    std::vector<uint8_t>                 slot_claimed;  // [n_slots] a worker owns the load
+    std::vector<uint8_t>                 slot_pending;  // [n_slots] slabs still in flight for this slot
     std::vector<uint64_t>                slot_gen;      // [n_slots] reservation generation
     std::vector<int64_t>                 slot_last_use; // [n_slots] LRU stamps
     std::unordered_map<int32_t, int32_t> expert_slot;   // RESIDENT and LOADING entries
@@ -130,7 +130,8 @@ struct llama_moe_stream_work {
 
     int32_t  expert = -1;
     int32_t  slot   = -1;
-    uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
+    int32_t  widx   = -1; // which weight slab of the expert; one work item per slab
+    uint64_t gen    = 0;  // stale unless it matches slot_gen[slot]
 };
 
 struct llama_moe_stream {
@@ -218,6 +219,11 @@ struct llama_moe_stream {
 
         // how often a hot expert had to be split across waves to fit the static chunk
         int64_t n_pair_splits = 0;
+
+        // per-miss anatomy: SSD read vs Metal upload, and how many slabs were moved
+        int64_t t_io_read_us   = 0;
+        int64_t t_io_upload_us = 0;
+        int64_t n_slabs_read   = 0;
     };
 
     llama_moe_stream_stats stats;

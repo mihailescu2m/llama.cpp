@@ -216,7 +216,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->n_slots  = n_slots;
         sl->slot_expert  .resize(n_slots, -1);
         sl->slot_state   .resize(n_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
-        sl->slot_claimed .resize(n_slots, 0);
+        sl->slot_pending .resize(n_slots, 0);
         sl->slot_gen     .resize(n_slots, 0);
         sl->slot_last_use.resize(n_slots, 0);
         sl->route_hotness.resize(n_expert, 0);
@@ -343,33 +343,51 @@ void llama_moe_stream::worker_loop() {
         q_demand.pop_front();
 
         auto & sl = *w.sl;
+        // no per-slot exclusion: several workers legitimately hold different slabs of the SAME slot
+        // at once, which is the entire point. Staleness is still checked per slot.
         if (w.gen != sl.slot_gen[w.slot] ||
             sl.slot_state[w.slot] != LLAMA_MOE_STREAM_SLOT_LOADING ||
             sl.slot_expert[w.slot] != w.expert ||
-            sl.slot_claimed[w.slot]) {
-            continue; // stale or duplicate item
+            w.widx < 0 || (size_t) w.widx >= sl.weights.size()) {
+            continue; // stale item
         }
-        sl.slot_claimed[w.slot] = 1;
 
         lk.unlock();
 
-        bool ok = true;
-        for (const auto & wt : sl.weights) {
-            const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
-            if (data == nullptr) {
-                ok = false;
-                break;
-            }
+        // Timed to separate the two halves of a miss. A miss currently reads its 2-3 weight slabs
+        // SEQUENTIALLY on one thread, so the device sees queue depth 1 even though the reads are
+        // independent - and it idles during each upload. Whether that is worth fixing depends on the
+        // read:upload split, which is what these two counters measure.
+        // exactly one slab, so N workers can be in flight on the same expert. Measured before this
+        // change: read 1.00 ms/slab, upload 0.065 ms/slab, i.e. 94% of a miss is the read, and the
+        // three reads of an expert were strictly serialised at the device's QD1 rate (~2.9 GB/s
+        // against 7.3 GB/s at QD8). Issuing them together is what raises the depth.
+        const auto & wt = sl.weights[w.widx];
+        const int64_t t0 = ggml_time_us();
+        const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert,
+                wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+        const int64_t t1 = ggml_time_us();
+        const bool ok = data != nullptr;
+        if (ok) {
             ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
         }
+        const int64_t t2 = ggml_time_us();
 
         lk.lock();
 
-        sl.slot_claimed[w.slot] = 0;
+        stats.t_io_read_us   += t1 - t0;
+        stats.t_io_upload_us += ok ? t2 - t1 : 0;
+        stats.n_slabs_read   += 1;
+
         if (!ok) {
             load_failed = true;
-        } else {
-            sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
+            sl.slot_pending[w.slot] = 0;
+        } else if (w.gen == sl.slot_gen[w.slot] && sl.slot_pending[w.slot] > 0) {
+            // the LAST slab to land publishes the slot; until then it stays LOADING, so no consumer
+            // can observe a half-filled expert
+            if (--sl.slot_pending[w.slot] == 0) {
+                sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
+            }
         }
         cv_done.notify_all();
     }
@@ -478,6 +496,18 @@ void llama_moe_stream::maybe_dump_stats_locked() {
                 dt > 0 ? 100.0*d_stall/dt      : 0.0,
                 dt > 0 ? 100.0*d_cpu/dt        : 0.0,
                 dt > 0 ? 100.0*(dt - d_op)/dt  : 0.0);
+
+        // per-miss anatomy: is a miss read-bound (parallelise the slab reads) or upload-bound
+        // (pipeline read against upload)?
+        const int64_t d_rd = stats.t_io_read_us   - stats_prev.t_io_read_us;
+        const int64_t d_up = stats.t_io_upload_us - stats_prev.t_io_upload_us;
+        const int64_t d_sl = stats.n_slabs_read   - stats_prev.n_slabs_read;
+        if (d_sl > 0) {
+            LLAMA_LOG_WARN("%s: moe stream: slabs %5" PRId64 " | read %7.2f ms (%5.3f ms/slab) | "
+                           "upload %7.2f ms (%5.3f ms/slab) | read %4.1f%% of miss\n",
+                    __func__, d_sl, d_rd/1000.0, d_rd/1000.0/d_sl, d_up/1000.0, d_up/1000.0/d_sl,
+                    (d_rd + d_up) > 0 ? 100.0*d_rd/(d_rd + d_up) : 0.0);
+        }
 
         if (stats.chunk_util_max > 0) {
             LLAMA_LOG_WARN("%s: moe stream: chunk utilisation worst = %" PRId64 "%% (100%% = abort)\n",
@@ -591,8 +621,17 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         if (it != sl->expert_slot.end()) {
             const int32_t s = it->second;
             if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                mgr->q_demand.push_back({ sl, e, s, sl->slot_gen[s] });
-                mgr->cv_work.notify_one();
+                // one work item PER SLAB: the 2-3 slabs of an expert are independent reads, and
+                // issuing them together is what lifts device queue depth above 1.
+                sl->slot_pending[s] = (uint8_t) sl->weights.size();
+
+                for (size_t wi = 0; wi < sl->weights.size(); wi++) {
+
+                    mgr->q_demand.push_back({ sl, e, s, (int32_t) wi, sl->slot_gen[s] });
+                    mgr->cv_work.notify_one();  // one wakeup per slab
+
+                }
+                // (workers woken per slab inside the loop above)
                 waited = true;
             }
             mgr->stats.n_hit++;
@@ -611,8 +650,17 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 mgr->stats.n_miss_cold++;
             }
             mgr->reserve_slot_locked(*sl, e, v);
-            mgr->q_demand.push_back({ sl, e, v, sl->slot_gen[v] });
-            mgr->cv_work.notify_one();
+            // one work item PER SLAB: the 2-3 slabs of an expert are independent reads, and
+            // issuing them together is what lifts device queue depth above 1.
+            sl->slot_pending[v] = (uint8_t) sl->weights.size();
+
+            for (size_t wi = 0; wi < sl->weights.size(); wi++) {
+
+                mgr->q_demand.push_back({ sl, e, v, (int32_t) wi, sl->slot_gen[v] });
+                mgr->cv_work.notify_one();  // one wakeup per slab
+
+            }
+            // (workers woken per slab inside the loop above)
             mgr->stats.n_miss++;
             waited = true;
             sl->keep[v] = 1;
@@ -997,8 +1045,17 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 // already in the cache (resident, or still loading from the previous wave's preload)
                 const int32_t s = it->second;
                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                    q_demand.push_back({ &sl, e, s, sl.slot_gen[s] }); // promote to demand, wait for it
-                    cv_work.notify_one();
+                    // one work item PER SLAB: the 2-3 slabs of an expert are independent reads, and
+                    // issuing them together is what lifts device queue depth above 1.
+                    sl.slot_pending[s] = (uint8_t) sl.weights.size();
+
+                    for (size_t wi = 0; wi < sl.weights.size(); wi++) {
+
+                        q_demand.push_back({ &sl, e, s, (int32_t) wi, sl.slot_gen[s] });
+                        cv_work.notify_one();  // one wakeup per slab
+
+                    }
+                    // (workers woken per slab inside the loop above)
                     waited = true;
                 } else {
                     stats.n_preload_ready++; // resident from the previous wave's preload
@@ -1019,8 +1076,17 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                     stats.n_miss_cold++;
                 }
                 reserve_slot_locked(sl, e, v);
-                q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
-                cv_work.notify_one();
+                // one work item PER SLAB: the 2-3 slabs of an expert are independent reads, and
+                // issuing them together is what lifts device queue depth above 1.
+                sl.slot_pending[v] = (uint8_t) sl.weights.size();
+
+                for (size_t wi = 0; wi < sl.weights.size(); wi++) {
+
+                    q_demand.push_back({ &sl, e, v, (int32_t) wi, sl.slot_gen[v] });
+                    cv_work.notify_one();  // one wakeup per slab
+
+                }
+                // (workers woken per slab inside the loop above)
                 stats.n_miss++;
                 waited = true;
                 sl.keep[v] = 1;
@@ -1046,8 +1112,17 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             }
             reserve_slot_locked(sl, e, v);
             sl.keep[v] = 1;
-            q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
-            cv_work.notify_one();
+            // one work item PER SLAB: the 2-3 slabs of an expert are independent reads, and
+            // issuing them together is what lifts device queue depth above 1.
+            sl.slot_pending[v] = (uint8_t) sl.weights.size();
+
+            for (size_t wi = 0; wi < sl.weights.size(); wi++) {
+
+                q_demand.push_back({ &sl, e, v, (int32_t) wi, sl.slot_gen[v] });
+                cv_work.notify_one();  // one wakeup per slab
+
+            }
+            // (workers woken per slab inside the loop above)
             stats.n_preload_issued++;
         }
     }
