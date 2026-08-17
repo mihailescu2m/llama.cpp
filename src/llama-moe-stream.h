@@ -35,6 +35,17 @@ bool moe_stream_partition();
 // note: multiple contexts decoding the same streamed model concurrently are not supported -
 // one context can evict slots referenced by the other's in-flight graph.
 
+// Read-latency histogram for expert slab reads: upper bounds in microseconds, plus one bucket for
+// everything above the last bound.
+//
+// The mean read time cannot separate a page-cache hit from an SSD read. A hit is a ~3 MB memcpy
+// (~0.2 ms), an SSD read is 1-3 ms, so the distribution is bimodal and the mean sits between the
+// modes - 3.19 ms/slab is consistent with anything from 0% to 40% hits. This histogram is what
+// sizes the page cache as an L2 tier behind the slot cache, which decides whether it is worth
+// protecting from prefill (prefill streams ~94 GB of experts through a page cache of a few GB).
+static const int64_t MOE_STREAM_READ_BUCKET_US[] = { 100, 250, 500, 1000, 2000, 4000, 8000 };
+static const int     MOE_STREAM_READ_BUCKETS     = 8;
+
 struct llama_moe_stream;
 
 enum llama_moe_stream_slot_state : uint8_t {
@@ -50,6 +61,27 @@ struct llama_moe_stream_weight {
     uint16_t file_idx  = 0; // GGUF split file index
     size_t   offs      = 0; // file offset of the full exps tensor data
     size_t   nb_expert = 0; // bytes per expert slab
+};
+
+struct llama_moe_stream_layer;
+
+// Userdata for the remap op when one-layer-ahead prefetch is on. The op keeps its normal job for
+// THIS layer and additionally predicts the NEXT layer's routing from this layer's router input,
+// issuing those loads a layer early.
+//
+// The prediction is deliberately the cheap one: topk(W_next . x_L). It skips the attention and FFN
+// terms between the two layers, so it is a lower bound - measured 72.1% top-6 overlap, and 46.3% of
+// the experts that actually STALL at K=6, for 0.35 wasted reads per layer-token. The exact version
+// would need layer L+1's attention output, i.e. running attention twice per layer (5 GB/token), so
+// it is not worth having.
+struct llama_moe_stream_lookahead {
+    llama_moe_stream_layer * sl      = nullptr; // this layer, remapped as usual
+    llama_moe_stream_layer * sl_next = nullptr; // layer to prefetch into, null = plain remap
+    uint32_t                 top_k   = 0;       // how many predicted experts to fetch
+    ggml_tensor *            bias_src = nullptr;// next layer's exp_probs_b, may be null
+    bool                     bias_read = false;
+    std::vector<float>       bias;              // host copy of bias_src, filled on first use
+    std::vector<float>       score;             // scratch [n_expert]
 };
 
 struct llama_moe_stream_layer;
@@ -122,6 +154,26 @@ struct llama_moe_stream_layer {
     // (e.g. grovemoe evaluates a second, unstreamed expert group on the same layer index)
     bool matches(const ggml_tensor * gate, const ggml_tensor * up,
                  const ggml_tensor * down, const ggml_tensor * gate_up) const;
+
+    // one-layer-ahead prefetch (LLAMA_MOE_STREAM_LOOKAHEAD=K). Set by the model at load time so
+    // build_moe_ffn can reach the NEXT layer's router without a signature change.
+    ggml_tensor * la_gate_inp = nullptr;   // next layer's ffn_gate_inp
+    ggml_tensor * la_bias_src = nullptr;   // next layer's exp_probs_b, may be null
+    struct llama_moe_stream_lookahead * la = nullptr;
+};
+
+// A layer whose expert choice is a token-id lookup instead of a router matmul (deepseek4 sets
+// hash_layer_count = 3). Routing there is known before the graph runs, so the loads can be issued at
+// the top of the pass rather than at the layer.
+//
+// Worth its own path because the miss load is wildly uneven: measured at cache 40, layers 0-2 are 3
+// of 43 layers but 36% of steady-state decode misses, and their share GROWS as the cache warms
+// (14% -> 36% over 200 tokens). They hash the token id, so they gain no locality - 237 distinct
+// experts touched over 200 tokens against 113 slots - while the learned-router layers settle.
+struct llama_moe_stream_hash_router {
+    llama_moe_stream_layer * sl  = nullptr;
+    ggml_tensor *            map = nullptr; // tid2eid {n_expert_used, n_vocab}, I32
+    std::vector<int32_t>     rows;          // host copy of map, filled on first use
 };
 
 // one queued expert load
@@ -147,6 +199,12 @@ struct llama_moe_stream {
         return il >= 0 && (size_t) il < layers.size() ? layers[il].get() : nullptr;
     }
 
+    std::vector<llama_moe_stream_hash_router> hash_routers;
+    uint32_t hash_n_used = 0; // n_expert_used, the row stride of every tid2eid
+
+    // idempotent; called at graph build, which is the first point the tensor pointer is known
+    void register_hash_router(int32_t il, ggml_tensor * tid2eid, uint32_t n_expert_used);
+
     // registers a streamed weight of layer il and returns its cache tensor
     ggml_tensor * create_cache_tensor(
             int32_t il, ggml_backend_buffer_type_t buft, const ggml_tensor * meta,
@@ -161,6 +219,10 @@ struct llama_moe_stream {
     size_t size_bufs() const;
 
     void print_stats() const;
+
+    // LLAMA_MOE_STREAM_NO_ZEROCOPY: stage reads through a bounce buffer even when the backend offers
+    // a host pointer. Kept as a switch because reading straight into the cache measured no better.
+    bool no_zerocopy = false;
 
     bool use_direct_io = false; // O_DIRECT streaming reads (LLAMA_MOE_STREAM_DIRECT), no page cache
 
@@ -197,6 +259,14 @@ struct llama_moe_stream {
         int64_t n_waves_run      = 0; // non-empty waves
         int64_t n_preload_issued = 0; // next-wave loads started during a wave's compute
         int64_t n_preload_ready  = 0; // wave experts already resident from the previous preload
+
+        // Decode has no waves, so n_preload_ready above is unreachable there and reads as 0 - it
+        // cannot say whether the lookahead prefetch is working. These two split a demand HIT by the
+        // slot's state, which distinguishes the two failure modes:
+        //   hit while LOADING  -> the prefetch picked the right expert but issued it too late
+        //   miss (not counted here) -> the prefetch picked the wrong expert, or never issued
+        int64_t n_hit_loading = 0; // hit on a slot still loading (a preload that did not land in time)
+        int64_t n_hit_ready   = 0; // hit on a slot already resident
         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
 
         // Total wall time inside the streaming custom ops, stall included. These ops run on the CPU
@@ -224,6 +294,9 @@ struct llama_moe_stream {
         int64_t t_io_read_us   = 0;
         int64_t t_io_upload_us = 0;
         int64_t n_slabs_read   = 0;
+
+        // read latency distribution; see MOE_STREAM_READ_BUCKET_US
+        int64_t n_read_bucket[MOE_STREAM_READ_BUCKETS] = {0};
     };
 
     llama_moe_stream_stats stats;
@@ -247,7 +320,7 @@ struct llama_moe_stream {
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
-    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n);
+    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n, uint32_t n_ids);
     void plan_pairs_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
     void emit_wave_pairs(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_pairs, int64_t chunk); // the 4 index rows
     void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids); // make wave w resident + preload next
@@ -256,6 +329,16 @@ struct llama_moe_stream {
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+// remap for THIS layer (src a, as above) plus a lookahead prefetch for the next layer driven by
+// this layer's router input (src b, f32 [n_embd] already multiplied by the next layer's gate_inp,
+// i.e. b holds the next layer's predicted logits). userdata is a llama_moe_stream_lookahead.
+void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
+
+// Identity on the ubatch token ids, with a side effect: start the loads for every hash-routed
+// layer. The hash layers take their tid2eid get_rows index from this op's output, which is what
+// orders it before layer 0. Never waits.
+void llama_moe_stream_prefetch_hash(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids
