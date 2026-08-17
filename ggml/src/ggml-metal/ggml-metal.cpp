@@ -99,6 +99,7 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
     /* .cpy_tensor    = */ ggml_backend_metal_buffer_shared_cpy_tensor,
     /* .clear         = */ ggml_backend_metal_buffer_shared_clear,
     /* .reset         = */ NULL,
+    /* .get_host_ptr  = */ ggml_backend_metal_buffer_shared_get_base,
 };
 
 // private buffer
@@ -615,7 +616,13 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    // GGML_METAL_NCB overrides the command-buffer split. Only useful for measurement: raising it
+    // adds command buffers without changing the work, which is how you price per-command-buffer
+    // GPU overhead against the graph's split count.
+    {
+        const char * val = getenv("GGML_METAL_NCB");
+        ggml_backend_metal_set_n_cb(backend, val ? atoi(val) : 1);
+    }
 
     return backend;
 }
@@ -710,7 +717,10 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    {
+        const char * val = getenv("GGML_METAL_NCB");
+        ggml_backend_metal_set_n_cb(backend, val ? atoi(val) : 1);
+    }
 
     return backend;
 
