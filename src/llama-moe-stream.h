@@ -15,6 +15,11 @@
 #include <utility>
 #include <vector>
 
+// LLAMA_MOE_STREAM_PARTITION: give each (token, expert) pair to exactly one wave instead of running
+// every wave over every pair and masking the rest to zero. Read in both llama-moe-stream.cpp and
+// llama-graph.cpp, which must agree: the graph sizes the gathered tensors that the planner fills.
+bool moe_stream_partition();
+
 // SSD streaming of MoE routed expert weights
 //
 // Streamed layers do not materialize their ffn_*_exps tensors; instead each weight gets a
@@ -91,6 +96,22 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> expert_wave; // [n_expert] wave each touched expert belongs to, 0xff = untouched
     std::vector<int32_t> plan_pool;   // resident slots the masked-out pairs of this wave park on
     std::vector<int32_t> pool_used;   // scratch: pool slots already used in the current token row
+
+    // Pair partitioning (LLAMA_MOE_STREAM_PARTITION=1). The default design runs the expert GEMMs
+    // once per wave over EVERY (token, expert) pair and masks the other waves' pairs to zero, so GPU
+    // cost scales with wave count - measured at ~8.15 s per wave atop a ~26.9 s fixed cost for a
+    // 3798-token prefill, i.e. ~33 s discarded at the default 5 waves.
+    //
+    // Partitioning by TOKEN is impossible here: a token needs n_expert_used experts and a wave holds
+    // only plan_capacity of n_expert, so ~no token's picks fit in one wave. Pairs, however, already
+    // belong to exactly one wave via expert_wave[], so the GEMM can run over a dense pair list with
+    // the expert dimension collapsed to 1, then scatter back. plan_pair_chunk is fixed at
+    // ceil(n_tokens*n_ids / n_waves) because ggml shapes are static; short waves pad.
+    uint32_t plan_pair_chunk = 0;                // static per-wave bound, set at graph build
+    uint32_t plan_waves_want = 0;                // wave count the graph built, 0 = not partitioned
+    std::vector<uint32_t> wave_first, wave_count; // [n_waves] this wave's slice of uniq
+    std::vector<std::vector<int32_t>> plan_pair;  // [n_waves][<= plan_pair_chunk] flat idx t*n_ids+k
+    std::vector<int32_t>              pair_count; // [n_expert] pairs per expert, for wave balancing
 
     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave op userdata
 
@@ -184,6 +205,19 @@ struct llama_moe_stream {
         // Needed to answer what the ~92% of non-stall prefill actually is: Metal GEMM, or this.
         int64_t t_wave_op_us  = 0; // in llama_moe_stream_wave_ids  (prefill, multi-wave path)
         int64_t t_remap_op_us = 0; // in llama_moe_stream_remap     (decode, single-wave path)
+
+        // Pair partitioning only. The graph fixes the per-wave pair chunk before the router runs, so
+        // the slack it carries over the mean has to cover whatever imbalance the planner is left with
+        // after LPT - and that slack is pure waste, the one cost the partition path still pays. This
+        // is the measurement that sizes it: the worst (max wave load / mean - 1) seen, in percent.
+        int64_t pair_over_max = 0;
+
+        // worst wave load as a % of plan_pair_chunk. The margin to 100% IS the crash margin, and
+        // unlike imbalance-over-mean it accounts for the n_tokens floor on the chunk.
+        int64_t chunk_util_max = 0;
+
+        // how often a hot expert had to be split across waves to fit the static chunk
+        int64_t n_pair_splits = 0;
     };
 
     llama_moe_stream_stats stats;
@@ -207,7 +241,9 @@ struct llama_moe_stream {
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
-    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
+    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n);
+    void plan_pairs_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
+    void emit_wave_pairs(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_pairs, int64_t chunk); // the 4 index rows
     void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids); // make wave w resident + preload next
     void emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_tok); // write the slot ids
 };
@@ -217,7 +253,18 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids
-//   wave_ids:  makes wave w's expert slice resident and emits slot ids (masked pairs park on a pool)
-//   wave_mask: emits 1.0 for pairs belonging to wave w, 0.0 otherwise
-void llama_moe_stream_wave_ids (ggml_tensor * dst, int ith, int nth, void * userdata);
-void llama_moe_stream_wave_mask(ggml_tensor * dst, int ith, int nth, void * userdata);
+//   wave_ids:   makes wave w's expert slice resident and emits slot ids (masked pairs park on a pool)
+//   wave_mask:  emits 1.0 for pairs belonging to wave w, 0.0 otherwise
+//   wave_pairs: same staging, but emits the index rows of wave w's dense pair list (partition path)
+void llama_moe_stream_wave_ids  (ggml_tensor * dst, int ith, int nth, void * userdata);
+void llama_moe_stream_wave_mask (ggml_tensor * dst, int ith, int nth, void * userdata);
+void llama_moe_stream_wave_pairs(ggml_tensor * dst, int ith, int nth, void * userdata);
+
+// index rows of the wave_pairs output, an I32 [chunk, LLAMA_MOE_PAIR_ROWS] tensor
+enum llama_moe_pair_row {
+    LLAMA_MOE_PAIR_TOK  = 0, // token index, to gather the GEMM input row
+    LLAMA_MOE_PAIR_PAIR = 1, // flat pair index t*n_ids + k, to gather (weight_before_ffn) and scatter
+    LLAMA_MOE_PAIR_SLOT = 2, // cache slot the GEMM indexes
+    LLAMA_MOE_PAIR_EXP  = 3, // original expert id, for the biases and per-expert scales
+    LLAMA_MOE_PAIR_ROWS = 4,
+};
