@@ -375,6 +375,9 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    bool                             moe_stream;
+    int                              moe_stream_cache_gib;
+    int                              moe_stream_io_threads;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -420,6 +423,9 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* moe_stream           */ false,
+    /* moe_stream_cache_gib */ 0,
+    /* moe_stream_io_threads*/ 0,
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -467,6 +473,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -C, --cpu-mask <hex,hex>                          (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
+    printf("        --moe-stream                                stream MoE routed experts from disk\n");
+    printf("        --moe-stream-cache <GiB>                    expert cache budget (implies --moe-stream)\n");
+    printf("        --moe-stream-io-threads <n>                 expert load I/O threads\n");
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
@@ -935,6 +944,21 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_op_offload.insert(params.no_op_offload.end(), p.begin(), p.end());
+            } else if (arg == "--moe-stream") {
+                params.moe_stream = true;
+            } else if (arg == "--moe-stream-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_stream = true;
+                params.moe_stream_cache_gib = std::stoi(argv[i]);
+            } else if (arg == "--moe-stream-io-threads") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_stream_io_threads = std::stoi(argv[i]);
             } else if (arg == "--no-host") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1260,6 +1284,9 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    bool               moe_stream;
+    int                moe_stream_cache_gib;
+    int                moe_stream_io_threads;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1274,6 +1301,14 @@ struct cmd_params_instance {
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
+
+        // MoE expert streaming: without this llama-bench cannot load a model whose experts do not
+        // fit in RAM, which is the only way to bench one on a memory-constrained machine.
+        mparams.moe_stream = moe_stream;
+        if (moe_stream) {
+            mparams.moe_stream_budget     = (uint64_t) moe_stream_cache_gib * 1024ull*1024ull*1024ull;
+            mparams.moe_stream_io_threads = moe_stream_io_threads;
+        }
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1405,6 +1440,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .moe_stream            = */ params.moe_stream,
+                /* .moe_stream_cache_gib  = */ params.moe_stream_cache_gib,
+                /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
             };
             instances.push_back(instance);
         }
@@ -1442,6 +1480,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .moe_stream            = */ params.moe_stream,
+                /* .moe_stream_cache_gib  = */ params.moe_stream_cache_gib,
+                /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
             };
             instances.push_back(instance);
         }
@@ -1479,6 +1520,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .moe_stream            = */ params.moe_stream,
+                /* .moe_stream_cache_gib  = */ params.moe_stream_cache_gib,
+                /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
             };
             instances.push_back(instance);
         }
