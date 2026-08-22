@@ -825,10 +825,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // UNION-8: instead of masking over the whole pooled history, attend the contiguous raw window
     // plus, per block of 8 queries, only the union of their selections - each query masked back to
     // its own set by the membership byte. Cost becomes near-flat in context.
-    // LLAMA_DSV4_UNION=1 to enable; falls back to the dense mask otherwise.
+    // ON by default. The n_csa >= union_min_ncsa gate below is what keeps it off where dense wins,
+    // so a separate opt-in switch only risked shipping the dense path by accident.
+    // LLAMA_DSV4_UNION=0 is the kill switch.
     static const bool union_enabled = [] {
         const char * e = getenv("LLAMA_DSV4_UNION");
-        return e != nullptr && atoi(e) > 0;
+        return e == nullptr || atoi(e) > 0;
     }();
 
     // Union attention has a HIGHER fixed cost than dense but a much shallower slope in context
