@@ -267,6 +267,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         }
     }
 
+    // GGML_METAL_KPROF: every command buffer of the graph has completed, so the counter sample
+    // buffers recorded during encoding can now be resolved
+    ggml_metal_kprof_flush();
+
     // release any completed extra command buffers
     if (ctx->cmd_bufs_ext.count > 0) {
         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
@@ -438,6 +442,39 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    // GGML_METAL_KPROF: KPROF records carry only raw node indices, so dump each distinct graph's
+    // static shape once (keyed by uid). That is what turns timings into a per-kernel attribution.
+    // The KPROFS marker ties each later flush to the graph that produced it - stderr writes from
+    // here and from synchronize() are both on the calling thread, so log order is exact.
+    if (ggml_metal_kprof_stride() > 0) {
+        static uint64_t kprof_dumped_uids[64] = { 0 };
+        static int      kprof_n_dumped = 0;
+
+        fprintf(stderr, "KPROFS {\"uid\":%llu,\"n_nodes\":%d,\"n_cb\":%d}\n",
+                (unsigned long long) gf->uid, gf->n_nodes, ctx->n_cb);
+
+        bool dumped = false;
+        for (int i = 0; i < kprof_n_dumped; ++i) {
+            if (kprof_dumped_uids[i] == gf->uid) {
+                dumped = true;
+                break;
+            }
+        }
+
+        if (!dumped && kprof_n_dumped < 64) {
+            kprof_dumped_uids[kprof_n_dumped++] = gf->uid;
+
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                const struct ggml_tensor * n = gf->nodes[i];
+                fprintf(stderr, "KPROFN {\"uid\":%llu,\"node\":%d,\"op\":\"%s\",\"name\":\"%s\","
+                        "\"ne\":[%lld,%lld,%lld,%lld]}\n",
+                        (unsigned long long) gf->uid, i, ggml_op_desc(n), n->name,
+                        (long long) n->ne[0], (long long) n->ne[1],
+                        (long long) n->ne[2], (long long) n->ne[3]);
+            }
+        }
+    }
+
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;

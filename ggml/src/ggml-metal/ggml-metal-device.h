@@ -92,6 +92,31 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 //
+// GGML_METAL_KPROF: per-kernel GPU attribution (opt-in, measurement only)
+//
+// Apple GPUs only support MTLCounterSamplingPointAtStageBoundary - verified on M1 Max, where
+// Draw/Dispatch/TileDispatch/BlitBoundary all report unsupported - so per-dispatch GPU timestamps
+// are not available. Instead, when kprof is active the encoder is split into one compute pass per
+// node (or per GGML_METAL_KPROF nodes) and each pass samples the GPU timestamp counter at its start
+// and end boundary. Splitting costs one encoder boundary per segment; sweeping the stride
+// (GGML_METAL_KPROF=1,2,4,8,...) calibrates that overhead.
+//
+// Ported from Agusx1211/llama-cpp-ds4f-m2-ultra. Measurement only: when GGML_METAL_KPROF is unset
+// every function here is a no-op and the encode path is byte-for-byte the usual one.
+//
+
+// non-zero when GGML_METAL_KPROF is set to a positive stride
+int  ggml_metal_kprof_stride(void);
+
+// end the current compute pass and begin a new counter-sampled one. `raw_node_idx` is the graph
+// node index that starts the new segment. no-op (returns -1) when kprof is inactive.
+int  ggml_metal_encoder_kprof_split(ggml_metal_encoder_t encoder, int raw_node_idx);
+
+// resolve every completed segment recorded since the last flush and emit one `KPROF ` JSONL record
+// per segment on stderr. Must be called only after the owning command buffers have completed.
+void ggml_metal_kprof_flush(void);
+
+//
 // MTLLibrary wrapper
 //
 
