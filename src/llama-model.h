@@ -228,6 +228,13 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    // qwen4exp MTP glue
+    struct ggml_tensor * fc_embd   = nullptr;
+    struct ggml_tensor * fc_hidden = nullptr;
+    struct ggml_tensor * hc_norm   = nullptr;
+    struct ggml_tensor * hc_down   = nullptr;
+    struct ggml_tensor * hc_up     = nullptr;
 };
 
 struct llama_layer_switch_lora {
