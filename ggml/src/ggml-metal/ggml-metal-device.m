@@ -2023,9 +2023,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_UNION:
-            // union-8 is instantiated for the DSV4 MLA shape only
+            // instantiated for the DSV4 MLA head size only. GQA itself is fine - the apparent
+            // failures at 48q:2kv were a bug in the CPU *reference*, not in this kernel.
             return op->src[1]->type == GGML_TYPE_F16 && op->src[4] &&
-                   op->src[0]->ne[0] == 512 && op->src[2]->ne[0] == 512;
+                   op->src[0]->ne[0] == 512 && op->src[2]->ne[0] == 512 &&
+                   op->src[0]->ne[2] % op->src[1]->ne[2] == 0;
         case GGML_OP_UNION_BUILD:
             // the kernel keeps the pooled-row bitmap in threadgroup memory: 65536 rows = 8 KB
             return op->src[0]->type == GGML_TYPE_I32 &&

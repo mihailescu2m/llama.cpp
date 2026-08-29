@@ -9502,6 +9502,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 1024, 64, 64, 0, true));
     // n_dense > 0 exercises the TWO-PHASE loop: contiguous masked prefix, then the union region
     test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 1024, 64, 64, 128, false));
+    // GQA coverage. The CPU reference mapped query heads to KV heads with `h % k->ne[2]`, which
+    // only coincides with the correct divide when n_head_kv == 1 or n_head == n_head_kv - so a
+    // CORRECT backend was reported as failing for any real GQA shape. These pin the fix.
+    test_cases.emplace_back(new test_flash_attn_union(512, 2, 24, 1024, 64, 64, 0, false));
+    test_cases.emplace_back(new test_flash_attn_union(512, 2,  1, 1024, 64, 64, 0, false));
+    test_cases.emplace_back(new test_flash_attn_union(512, 4,  1, 1024, 64, 64, 0, false));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1,  2, 1024, 64, 64, 0, false));
+    test_cases.emplace_back(new test_flash_attn_union(512, 2,  2, 1024, 64, 64, 0, false));
+    test_cases.emplace_back(new test_flash_attn_union(512, 4,  4, 1024, 64, 64, 0, false));
     test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 2048, 64, 128, 256, false));
     test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 512, 64, 512, 0));
 

@@ -12111,7 +12111,10 @@ void ggml_compute_forward_flash_attn_union(const struct ggml_compute_params * pa
     std::vector<float> sc;
 
     for (int64_t h = 0; h < NH; ++h) {
-        const int64_t hk = h % k->ne[2];
+        // GQA: query head h belongs to KV head h/(n_head/n_head_kv). Modulo is WRONG and only
+        // coincides with the divide when n_head_kv == 1 or n_head == n_head_kv, which is why this
+        // went unnoticed - the DSV4 MLA shape is 64 query heads : 1 KV head, the first case.
+        const int64_t hk = h / (NH / k->ne[2]);
 
         for (int64_t t = 0; t < NQ; ++t) {
             const int64_t b  = t / Q;
