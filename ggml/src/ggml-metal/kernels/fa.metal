@@ -2435,7 +2435,13 @@ kernel void kernel_union_build(
         out[i] = 0;
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // NOTE the device flag. `out` is DEVICE memory, zeroed here by every lane and atomically OR'd
+    // below by (different) lanes. A threadgroup-only fence does not order device-memory accesses
+    // across lanes, so a zero could land after another lane's OR and erase it - dropping a
+    // selection, which silently changes attention output, non-deterministically per run.
+    // The other two barriers in this kernel guard only threadgroup memory (bitmap, wordbase) and
+    // are correct as they are.
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
 
     // pass A: mark every selected row
     const int n_this = min((int) args.block, args.n_tokens - ib*args.block);
