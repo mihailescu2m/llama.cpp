@@ -477,6 +477,18 @@ public:
     const bool blk_bias;
 };
 
+// Select the indexer's top-k over BLOCKS rather than over expanded cells.
+// Read once through a single predicate: duplicating the default elsewhere made the allocator
+// drop cell_blk and abort on GGML_ASSERT(buffer) at load.
+// LLAMA_QWEN4EXP_BLOCK_TOPK=0 falls back to the cell-level path.
+static bool qwen4exp_block_topk() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_QWEN4EXP_BLOCK_TOPK");
+        return !e || atoi(e) != 0;
+    }();
+    return v;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -529,6 +541,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->bias);
 
         inp = qsa.get();
+
+        // set_input_qsa fills cell_blk unconditionally and asserts on its buffer, but the
+        // block-level top-k path never reads it, so the allocator would leave it unbacked.
+        // One zero-scaled reference per graph keeps it allocated (~157 KB at 32k).
+        if (qwen4exp_block_topk()) {
+            ggml_build_forward_expand(gf,
+                    ggml_scale(ctx0, ggml_cast(ctx0, inp->cell_blk, GGML_TYPE_F32), 0.0f));
+        }
+
         res->add_input(std::move(qsa));
         qsa_inps.emplace((uint32_t) r, inp);
     }
@@ -590,6 +611,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // one value per block, so it is cheaper to bias here than after the cells are expanded
     if (blk_bias) {
         score = ggml_add(ctx0, score, inp->bias);
+    }
+
+    // the reference budget is whole blocks, so selecting over BLOCKS avoids materializing the
+    // [n_kv, n_tps] cell-score table entirely and shrinks the top-k input by compress_ratio.
+    // All r cells of a block carry the SAME score, so the cell-level cut below splits the
+    // boundary block arbitrarily (it takes r-1 of r cells with identical scores); selecting
+    // whole blocks takes all r. Causality is unaffected: build_attn_qsa still adds the causal
+    // mask after selection, so any future cell in a selected block stays masked at attention.
+    // A ragged last block would let blk*r + j run past n_kv, so require an even division.
+    if (qwen4exp_block_topk() && blk_bias && n_kv % r == 0) {
+        const int64_t width_c   = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+        const int64_t n_blk_sel = std::min<int64_t>(n_blocks, (width_c + r - 1)/r);
+
+        // score is [n_blocks, n_tps, n_stream] and already carries the per-block bias
+        ggml_tensor * blk_top = ggml_top_k(ctx0, score, n_blk_sel);
+        cb(blk_top, "indexer_top_blk", il);
+
+        // expand block ids to cell ids: cell = blk*r + j, j in [0, r)
+        ggml_tensor * bf = ggml_scale(ctx0, ggml_cast(ctx0, blk_top, GGML_TYPE_F32), (float) r);
+        bf = ggml_reshape_4d(ctx0, bf, 1, n_blk_sel, n_tps, n_stream);
+
+        ggml_tensor * off = ggml_arange(ctx0, 0.0f, (float) r, 1.0f);
+        off = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, off, r, 1, 1, 1),
+                             r, n_blk_sel, n_tps, n_stream);
+
+        ggml_tensor * cells = ggml_cast(ctx0, ggml_add(ctx0, off, bf), GGML_TYPE_I32);
+        cells = ggml_reshape_4d(ctx0, cells, r*n_blk_sel, n_tps, 1, n_stream);
+        cb(cells, "indexer_top_k", il);
+
+        return cells;
     }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
