@@ -2565,6 +2565,23 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // the draft model inherits the TARGET's expert-cache budget. For a 3-stage DFlash/DSpark
+    // drafter that budget covers all 256 experts per stage, so llama_moe_stream_resolve_slots
+    // reports "cache of N slots covers all 256 experts -- streaming disabled, loading normally"
+    // and the entire drafter stays resident: 11-13 GB for a 7.2 GB file. On a memory-bound box
+    // that comes straight out of the target's expert cache, which is the thing speculation needs.
+    // Give the drafter its own small slot count so it actually streams.
+    if (mparams.moe_stream) {
+        uint32_t slots = 96;                      // per streamed layer; < n_expert or it will not stream
+        if (const char * e = getenv("LLAMA_SPEC_DRAFT_MOE_SLOTS")) {
+            slots = (uint32_t) atoi(e);
+        }
+        if (slots > 0) {
+            mparams.moe_stream_slots  = slots;
+            mparams.moe_stream_budget = 0;        // slots take precedence over the byte budget
+        }
+    }
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
@@ -2576,6 +2593,25 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // the draft context inherits the target's n_batch/n_ubatch, but a drafter only submits
+    // n_seq*(n_max+1) tokens when drafting, and chunks prompt processing by n_ubatch anyway.
+    // for a small drafter the oversized compute buffer does not matter, but a DFlash/DSpark
+    // drafter is an MoE model (3 blocks x 256 experts) where buffers sized for the target's
+    // batch cost GBs - memory the target's expert cache needs.
+    // NOT for draft-mtp: the MTP head is fed the target's own batches, prefill chunks
+    // included, so its context must accept n_batch tokens like the target. Capping it at
+    // 512 aborts in common_batch_add ("llama_batch size exceeded") on the first prompt
+    // chunk larger than that.
+    if (!spec_mtp) {
+        const uint32_t n_batch_dft = 512; // >= n_seq*(n_max+1) for any supported block size
+        if (cparams.n_batch > n_batch_dft) {
+            cparams.n_batch = n_batch_dft;
+        }
+        if (cparams.n_ubatch > n_batch_dft) {
+            cparams.n_ubatch = n_batch_dft;
+        }
+    }
 
     std::string model_path;
     if (has_draft) {
