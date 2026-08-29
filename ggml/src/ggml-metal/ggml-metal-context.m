@@ -491,22 +491,25 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // The KPROFS marker ties each later flush to the graph that produced it - stderr writes from
     // here and from synchronize() are both on the calling thread, so log order is exact.
     if (ggml_metal_kprof_stride() > 0) {
-        static uint64_t kprof_dumped_uids[64] = { 0 };
-        static int      kprof_n_dumped = 0;
+        // dedup by graph SHAPE, not uid: every graph compute mints a fresh uid, so a uid-keyed
+        // table burns its slots on repeats of the same few shapes and leaves the later (larger)
+        // graphs unmapped - KPROF records then cannot be attributed to an op at all.
+        static int kprof_dumped_shapes[256] = { 0 };
+        static int kprof_n_dumped = 0;
 
         fprintf(stderr, "KPROFS {\"uid\":%llu,\"n_nodes\":%d,\"n_cb\":%d}\n",
                 (unsigned long long) gf->uid, gf->n_nodes, ctx->n_cb);
 
         bool dumped = false;
         for (int i = 0; i < kprof_n_dumped; ++i) {
-            if (kprof_dumped_uids[i] == gf->uid) {
+            if (kprof_dumped_shapes[i] == gf->n_nodes) {
                 dumped = true;
                 break;
             }
         }
 
-        if (!dumped && kprof_n_dumped < 64) {
-            kprof_dumped_uids[kprof_n_dumped++] = gf->uid;
+        if (!dumped && kprof_n_dumped < 256) {
+            kprof_dumped_shapes[kprof_n_dumped++] = gf->n_nodes;
 
             for (int i = 0; i < gf->n_nodes; ++i) {
                 const struct ggml_tensor * n = gf->nodes[i];
