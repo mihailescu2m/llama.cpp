@@ -251,6 +251,10 @@ struct server_slot {
     // speculative decoding
     common_speculative * spec;
 
+    // disable speculation for prompts longer than this (0 = no limit); see
+    // common_params_speculative::n_prompt_max for the measurements behind it
+    int32_t spec_n_prompt_max = 0;
+
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
@@ -468,7 +472,17 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        if (!spec) {
+            return false;
+        }
+
+        // a draft head is an extra layer over the WHOLE prompt, so past a prompt length it can no
+        // longer pay for itself within a normal answer - see common_params_speculative::n_prompt_max
+        if (spec_n_prompt_max > 0 && task && task->n_tokens() > spec_n_prompt_max) {
+            return false;
+        }
+
+        return true;
     }
 
     void add_token(const completion_token_output & token) {
@@ -1293,6 +1307,8 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+
+            slot.spec_n_prompt_max = params_base.speculative.n_prompt_max;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -3732,7 +3748,17 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        // skip the draft head's own prefill when no active slot intends to speculate - otherwise
+        // --spec-max-prompt would still pay the very cost it exists to avoid
+        bool spec_wanted = false;
+        for (const auto & s : slots) {
+            if (s.is_processing() && s.can_speculate()) {
+                spec_wanted = true;
+                break;
+            }
+        }
+
+        if (spec && spec_wanted) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);

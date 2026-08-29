@@ -4293,6 +4293,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
+        {"--spec-max-prompt"}, "N",
+        string_format("disable speculation when the prompt exceeds N tokens (default: %d, 0 = no limit)\n"
+                      "a draft head is an extra layer over the WHOLE prompt, so on a long prompt with\n"
+                      "a short answer it costs more prefill than it saves in decode. Only useful for\n"
+                      "draft-model methods - n-gram speculation has no prefill cost and needs no limit",
+                      params.speculative.n_prompt_max),
+        [](common_params & params, int value) {
+            params.speculative.n_prompt_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MAX_PROMPT"));
+    add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
             common_speculative_type_name_str(params.speculative.types).c_str()),

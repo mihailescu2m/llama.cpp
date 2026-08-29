@@ -373,6 +373,15 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // disable speculation once the prompt exceeds this many tokens (0 = no limit). A draft head
+    // is an extra layer evaluated over the WHOLE prompt, so its prefill cost scales with context
+    // while its per-token decode saving does not. Measured on qwen4exp + its native MTP head:
+    //   32k prompt : MTP costs  3.7 s of prefill, pays back after   119 generated tokens
+    //  128k prompt : MTP costs 57.7 s of prefill, pays back after 2369 generated tokens
+    // so on a long prompt with a short answer speculation is a net LOSS. This gates both the
+    // draft prefill and the drafting itself, so nothing is paid for a skipped request.
+    int32_t n_prompt_max = 0;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
