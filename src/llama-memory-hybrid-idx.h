@@ -123,7 +123,7 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
-    // nullptr with no indexer, and for the update context, which builds no sparse graph
+    // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified

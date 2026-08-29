@@ -47,6 +47,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
+        // cached indexer keys are stored RAW - build_qsa_top_k pools, norms and ropes them itself -
+        // so a pending cache update must not apply rope shifts to them
+        hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
@@ -295,7 +298,11 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
                   llama_context * lctx,
                            bool   optimize) :
     llama_memory_hybrid_context(mem, lctx, optimize),
-    mem(mem) {}
+    mem(mem),
+    // apply pending indexer-cache updates alongside the attention and recurrent state, so a
+    // non-unified cross-stream sequence copy carries the indexer data with it
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        mem->get_mem_idx()->init_update(lctx, optimize)) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
