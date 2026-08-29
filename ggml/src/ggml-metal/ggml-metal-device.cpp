@@ -910,7 +910,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
-                smem = 32*sizeof(float);
+                // byte-indexed half2 table: 256 entries x 4 B = 1 KiB. Trades table size (measured
+                // to cost ~5% across a 32x range) for half the indexed loads, which is what tracks.
+                smem = 256*2*sizeof(ggml_fp16_t);
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -1144,7 +1146,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
-                smem = 32*sizeof(float);
+                // byte-indexed half2 table: 256 entries x 4 B = 1 KiB. Trades table size (measured
+                // to cost ~5% across a 32x range) for half the indexed loads, which is what tracks.
+                smem = 256*2*sizeof(ggml_fp16_t);
             } break;
         case GGML_TYPE_Q2_K:
             {
