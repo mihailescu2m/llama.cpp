@@ -542,7 +542,14 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
         ctx->kprof_count++;
     }
 
-    if (ctx->use_capture) {
+    // GGML_METAL_DEBUG_GROUPS names every dispatch after its ggml op so an external Metal profiler
+    // can attribute GPU time per op. use_capture already does this, but only for ONE graph and only
+    // while starting a real Metal capture, which conflicts with a profiler that is already recording.
+    static const bool debug_groups = getenv("GGML_METAL_DEBUG_GROUPS") != nullptr;
+
+    const bool label = ctx->use_capture || debug_groups;
+
+    if (label) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
 
@@ -552,7 +559,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
                 "https://github.com/ggml-org/llama.cpp/pull/14849");
     }
 
-    if (ctx->use_capture) {
+    if (label) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);
     }
 
