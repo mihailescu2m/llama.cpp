@@ -2138,8 +2138,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        // ggml_argsort_top_k fully sorts all n_expert scores and views the first k. GGML_OP_TOP_K
+        // has identical semantics (descending, largest-first) and a dedicated kernel.
+        selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
@@ -2290,7 +2291,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * ids_gemm = selected_experts;
     if (msl && n_stream_waves == 1) {
-        ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+        // GGML_OP_TOP_K already writes a contiguous tensor; only a view needs the copy
+        ggml_tensor * ids_cont = ggml_is_contiguous(selected_experts)
+            ? selected_experts : ggml_cont(ctx0, selected_experts);
 
         // The GPU owns residency: no CPU op, so no graph split. The kernel resolves hits from its
         // device table, evicts by least-recent use for misses and hands the slot list to a servicer
