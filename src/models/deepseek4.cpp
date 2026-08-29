@@ -749,42 +749,68 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
 
     // The lightning indexer picks n_sel of the n_csa pooled entries, but expressing that choice as a
     // mask over the whole pooled history leaves attention O(n_csa) - which is the long-context
-    // prefill quadratic. With a single query there is exactly ONE selection set, so the chosen rows
-    // can be gathered into a compact K/V and the ordinary dense kernel then runs over n_sel instead
-    // of n_csa. Measured on the Metal FA kernel at 41k of context: 1481 us -> 567 us per layer.
+    // prefill quadratic. The chosen rows are gathered into a compact K/V and the ordinary dense
+    // kernel runs over n_sel instead of n_csa. Measured on the Metal FA kernel at 41k of context:
+    // 1481 us -> 567 us per layer.
     //
-    // n_tokens == 1 only: every query has its OWN set, so a batch would need a different K per
-    // query, which shared-K attention cannot express. Prefill needs a sparse kernel instead.
+    // n_tokens == 1: each query has its own selection set, gathered into shared K with the selected
+    // mask rows (data-dependent). n_tokens > 1 (spec-verify batches, up to
+    // LLM_DSV4_UNION_GATHER_MAX_TOKENS): the union of all T sets is gathered into one shared K and
+    // masked per token by a structural block-diagonal constant, so all T queries stay in one
+    // flash_attn_ext and keep K tiles shared. Larger batches (prefill) fall back to the dense mask.
     ggml_tensor * k_all   = nullptr;
     ggml_tensor * kq_mask = nullptr;
 
-    const bool gather_sel = n_tokens == 1 && top_k->ne[0] < n_csa &&
-                            getenv("LLAMA_DSV4_SPARSE_GATHER") != nullptr;
+    const int64_t n_stream = csa_k->ne[3];
+    const bool gather_sel = n_stream == 1 && top_k->ne[0] < n_csa &&
+                            dsv4_sparse_gather_enabled() &&
+                            (n_tokens == 1 ||
+                             (n_tokens >= 2 && n_tokens <= LLM_DSV4_UNION_GATHER_MAX_TOKENS && inp_csa.mask_g != nullptr));
 
     if (gather_sel) {
         const int64_t n_sel = top_k->ne[0];
 
-        ggml_tensor * idx = ggml_reshape_1d(ctx0, top_k, n_sel);
-
         // csa_k is [n_embd_head, 1, n_csa, 1] and contiguous, so the kv axis is a plain row index
         ggml_tensor * csa_2d = ggml_view_2d(ctx0, csa_k, csa_k->ne[0], n_csa, csa_k->nb[2], 0);
 
-        ggml_tensor * sel = ggml_get_rows(ctx0, csa_2d, idx); // get_rows promotes to f32
-        sel = ggml_cast(ctx0, sel, csa_k->type);
-        sel = ggml_reshape_4d(ctx0, sel, csa_k->ne[0], 1, n_sel, 1);
-        cb(sel, "csa_k_sel", il);
+        if (n_tokens == 1) {
+            ggml_tensor * idx = ggml_reshape_1d(ctx0, top_k, n_sel);
 
-        k_all = ggml_concat(ctx0, raw_k, sel, 2);
+            ggml_tensor * sel = ggml_get_rows(ctx0, csa_2d, idx); // get_rows promotes to f32
+            sel = ggml_cast(ctx0, sel, csa_k->type);
+            sel = ggml_reshape_4d(ctx0, sel, csa_k->ne[0], 1, n_sel, 1);
+            cb(sel, "csa_k_sel", il);
 
-        // the same rows of the mask, so causality and validity still apply to what was selected
-        ggml_tensor * m_2d = ggml_view_2d(ctx0, inp_csa.kq_mask, 1, n_csa,
-                ggml_type_size(inp_csa.kq_mask->type), 0);
+            k_all = ggml_concat(ctx0, raw_k, sel, 2);
 
-        ggml_tensor * m_sel = ggml_get_rows(ctx0, m_2d, idx);
-        m_sel = ggml_cast(ctx0, m_sel, inp_csa.kq_mask->type);
-        m_sel = ggml_reshape_2d(ctx0, m_sel, n_sel, 1);
+            // the same rows of the mask, so causality and validity still apply to what was selected
+            ggml_tensor * m_2d = ggml_view_2d(ctx0, inp_csa.kq_mask, 1, n_csa,
+                    ggml_type_size(inp_csa.kq_mask->type), 0);
 
-        kq_mask = ggml_concat(ctx0, inp_attn->get_kq_mask(), m_sel, 0);
+            ggml_tensor * m_sel = ggml_get_rows(ctx0, m_2d, idx);
+            m_sel = ggml_cast(ctx0, m_sel, inp_csa.kq_mask->type);
+            m_sel = ggml_reshape_2d(ctx0, m_sel, n_sel, 1);
+
+            kq_mask = ggml_concat(ctx0, inp_attn->get_kq_mask(), m_sel, 0);
+        } else {
+            // union gather: top_k is [n_sel, T, 1, 1] (n_stream == 1), contiguous; flat index of
+            // (a0=j, a1=t) = j + t*n_sel, so token t's selections occupy [t*n_sel, (t+1)*n_sel)
+            const int64_t T = n_tokens;
+            ggml_tensor * idx_all = ggml_reshape_1d(ctx0, top_k, T*n_sel);
+
+            // gather the union of all T selection sets into one shared K
+            ggml_tensor * sel_all = ggml_get_rows(ctx0, csa_2d, idx_all);
+            sel_all = ggml_cast(ctx0, sel_all, csa_k->type);
+            sel_all = ggml_reshape_4d(ctx0, sel_all, csa_k->ne[0], 1, T*n_sel, 1);
+            cb(sel_all, "csa_k_sel_all", il);
+
+            k_all = ggml_concat(ctx0, raw_k, sel_all, 2);
+
+            // gathered rows are token-major, so per-token validity is the structural
+            // block-diagonal constant mask_g: gathered row r=t*n_sel+j is valid only for token t
+            GGML_ASSERT(inp_csa.mask_g);
+            kq_mask = ggml_concat(ctx0, inp_attn->get_kq_mask(), inp_csa.mask_g, 0);
+        }
     } else {
         k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
 
@@ -795,6 +821,68 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     }
     cb(k_all,   "csa_k_all", il);
     cb(kq_mask, "csa_lid_kq_mask", il);
+
+    // UNION-8: instead of masking over the whole pooled history, attend the contiguous raw window
+    // plus, per block of 8 queries, only the union of their selections - each query masked back to
+    // its own set by the membership byte. Cost becomes near-flat in context.
+    // LLAMA_DSV4_UNION=1 to enable; falls back to the dense mask otherwise.
+    static const bool union_enabled = [] {
+        const char * e = getenv("LLAMA_DSV4_UNION");
+        return e != nullptr && atoi(e) > 0;
+    }();
+
+    // Union attention has a HIGHER fixed cost than dense but a much shallower slope in context
+    // (measured 3.1x shallower), so it only pays once n_csa is large enough. Measured end to end:
+    //
+    //     n_prompt   dense    union+skip
+    //        4,773   98.15      92.23   0.94x
+    //       19,247  103.93     101.67   0.98x
+    //       23,084   99.93     100.19   1.003x   <- crossover, predicted to within 0.5%
+    //       38,237   88.70      96.50   1.09x
+    //
+    // The crossover is at ~23k prompt tokens. Per UBATCH the relevant quantity is n_csa, and union
+    // wins once n_csa exceeds roughly union_size * (dense_tput/union_tput) = ~1400 * 2.2 ~= 3100.
+    // 4096 is the next power of two above that. NOTE this is derived from a whole-prefill average,
+    // not measured per ubatch - retune with LLAMA_DSV4_UNION_MIN_NCSA if the graph mix changes.
+    //
+    // Switching mid-prefill is free: n_kv grows every ubatch, so can_reuse already fails and the
+    // graph is rebuilt regardless (llama-graph.cpp, `res &= (kq_mask->ne[0] == n_kv)`).
+    static const int64_t union_min_ncsa = [] {
+        const char * e = getenv("LLAMA_DSV4_UNION_MIN_NCSA");
+        return e != nullptr ? (int64_t) atoll(e) : (int64_t) 4096;
+    }();
+
+    const int64_t n_raw = raw_k->ne[2];
+
+    if (union_enabled && !gather_sel && n_stream == 1 && cparams.flash_attn &&
+        top_k->ne[0] < n_csa && n_tokens >= 8 && (n_raw % 64) == 0 &&
+        n_csa >= union_min_ncsa && n_csa <= 65536) {
+        ggml_tensor * uids = ggml_union_build(ctx0, top_k, n_csa, 8);
+        cb(uids, "csa_uids", il);
+
+        // same layout prep build_attn_mha does before ggml_flash_attn_ext: view q by stream, then
+        // permute q/k/v to (0,2,1,3) so ne[1] is the KV axis and ne[2] the heads
+        ggml_tensor * qq = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        qq = ggml_permute(ctx0, qq, 0, 2, 1, 3);
+
+        ggml_tensor * kk = ggml_permute(ctx0, k_all, 0, 2, 1, 3);
+        if (kk->type == GGML_TYPE_F32) {
+            kk = ggml_cast(ctx0, kk, GGML_TYPE_F16);
+        }
+
+        ggml_tensor * u = ggml_flash_attn_union(ctx0, qq, kk, kk, inp_attn->get_kq_mask(), uids,
+                (int) n_raw, kq_scale);
+
+        u = ggml_reshape_2d(ctx0, u, u->ne[0]*u->ne[1], u->ne[2]*u->ne[3]);
+
+        if (k_rot) {
+            u = llama_mul_mat_hadamard(ctx0, u, k_rot);
+        }
+        cb(u, "attn_csa_lid", il);
+
+        return u;
+    }
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
     if (k_rot) {

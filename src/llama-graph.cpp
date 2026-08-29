@@ -840,6 +840,63 @@ static bool dsv4_can_reuse_raw_kq_mask(
     return res;
 }
 
+bool dsv4_sparse_gather_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_DSV4_SPARSE_GATHER");
+        return env != nullptr && atoi(env) > 0;
+    }();
+    return enabled;
+}
+
+static ggml_tensor * dsv4_build_union_mask(
+        ggml_context * ctx,
+        int64_t n_sel,
+        int64_t n_tokens,
+        ggml_type type) {
+    if (n_sel == 0 || n_tokens == 0) {
+        return nullptr;
+    }
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_sel*n_tokens, n_tokens, 1, 1);
+    ggml_set_input(res);
+    ggml_set_name(res, "dsv4_csa_mask_g");
+
+    return res;
+}
+
+static void dsv4_set_union_mask(ggml_tensor * dst, int64_t n_sel) {
+    if (!dst || !dst->buffer) {
+        return;
+    }
+
+    GGML_ASSERT(dst->ne[2] == 1);
+    GGML_ASSERT(dst->ne[3] == 1);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const int64_t T = dst->ne[1];
+    const int64_t n_rows = dst->ne[0];
+    GGML_ASSERT(n_rows == n_sel*T);
+
+    if (dst->type == GGML_TYPE_F32) {
+        float * data = (float *) dst->data;
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t r = 0; r < n_rows; ++r) {
+                data[r + t*n_rows] = (r/n_sel == t) ? 0.0f : -INFINITY;
+            }
+        }
+    } else if (dst->type == GGML_TYPE_F16) {
+        ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+        const ggml_fp16_t fp16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
+        const ggml_fp16_t fp16_zero = llama_cast<ggml_fp16_t>(0.0f);
+
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t r = 0; r < n_rows; ++r) {
+                data[r + t*n_rows] = (r/n_sel == t) ? fp16_zero : fp16_ninf;
+            }
+        }
+    }
+}
+
 static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
     std::ostringstream ss;
     ss << "[";
@@ -1005,6 +1062,11 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
     dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
     dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
 
+    if (inp_csa.mask_g && inp_csa.mask_g->buffer) {
+        const int64_t n_sel = std::min<int64_t>(plan_lid.n_kv, hparams.indexer_top_k);
+        dsv4_set_union_mask(inp_csa.mask_g, n_sel);
+    }
+
     if (inp_csa.k_rot && inp_csa.k_rot->buffer) {
         mctx->get_csa()->set_input_k_rot(inp_csa.k_rot);
     }
@@ -1044,6 +1106,21 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
     res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca, params.ubatch.n_tokens, n_stream);
     res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid, params.ubatch.n_tokens, n_stream);
+
+    // mask_g exists only for spec-verify batch sizes (2..LLM_DSV4_UNION_GATHER_MAX_TOKENS) and is
+    // rebuilt when T (n_tokens) or n_sel changes, or when the gather flag toggles
+    const int64_t n_sel = std::min<int64_t>(plan_lid.n_kv, params.hparams.indexer_top_k);
+    const bool mask_g_wanted = dsv4_sparse_gather_enabled() &&
+                               params.ubatch.n_tokens >= 2 && params.ubatch.n_tokens <= LLM_DSV4_UNION_GATHER_MAX_TOKENS;
+    if (mask_g_wanted) {
+        res &= inp_csa.mask_g != nullptr &&
+               inp_csa.mask_g->ne[0] == (int64_t) params.ubatch.n_tokens*n_sel &&
+               inp_csa.mask_g->ne[1] == (int64_t) params.ubatch.n_tokens &&
+               inp_csa.mask_g->ne[2] == 1 &&
+               inp_csa.mask_g->ne[3] == 1;
+    } else {
+        res &= inp_csa.mask_g == nullptr;
+    }
 
     return res;
 }
@@ -3704,11 +3781,18 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
 
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
-    auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_dsv4>(hparams, cparams, std::move(inp_raw), mctx_cur);
 
     dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
     dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream);
     dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream);
+
+    if (dsv4_sparse_gather_enabled() &&
+        ubatch.n_tokens >= 2 && ubatch.n_tokens <= LLM_DSV4_UNION_GATHER_MAX_TOKENS) {
+        const int64_t n_sel = std::min<int64_t>(mctx_cur->get_lid_plan(ubatch).n_kv, hparams.indexer_top_k);
+        const ggml_type type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        inp->inp_csa.mask_g = dsv4_build_union_mask(ctx0, n_sel, ubatch.n_tokens, type);
+    }
     inp->inp_csa.k_rot = mctx_cur->get_csa()->build_input_k_rot(ctx0);
     inp->inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
     inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);

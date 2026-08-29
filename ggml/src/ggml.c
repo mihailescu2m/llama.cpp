@@ -1100,9 +1100,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MOE_SLOT_RESOLVE",
+    "UNION_BUILD",
+    "FLASH_ATTN_UNION",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1217,9 +1219,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "moe_slot_resolve(ids, state, ref)",
+    "union_build(x)",
+    "flash_attn_union(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5396,6 +5400,65 @@ struct ggml_tensor * ggml_argsort_top_k(
 }
 
 // ggml_top_k
+
+// max union per block: 8 queries x n_sel is the worst case, so this can never overflow and the
+// kernel never has to drop a selection (which would silently change attention output)
+struct ggml_tensor * ggml_union_build(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sel,
+        int                   n_csa,
+        int                   block) {
+    GGML_ASSERT(sel->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(sel));
+    GGML_ASSERT(block > 0 && block <= 8);
+    GGML_ASSERT(n_csa > 0 && n_csa <= (1 << 24));
+
+    const int64_t n_sel    = sel->ne[0];
+    const int64_t n_tokens = sel->ne[1];
+    const int64_t n_blocks = (n_tokens + block - 1)/block;
+
+    const int64_t max_union = block*n_sel;
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, max_union + 1, n_blocks);
+
+    ggml_set_op_params_i32(result, 0, n_csa);
+    ggml_set_op_params_i32(result, 1, block);
+
+    result->op     = GGML_OP_UNION_BUILD;
+    result->src[0] = sel;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_union(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * uids,
+        int                   n_dense,
+        float                 scale) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(uids->type == GGML_TYPE_I32);
+
+    // same output layout as ggml_flash_attn_ext
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 1, n_dense);
+
+    result->op     = GGML_OP_FLASH_ATTN_UNION;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[4] = uids;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_moe_slot_resolve(
         struct ggml_context * ctx,

@@ -12025,3 +12025,150 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// GGML_OP_UNION_BUILD - reference implementation
+//
+// Dedup the top-k selections of a block of queries into one shared, ASCENDING list. Each output
+// entry packs the pooled row id in the low 24 bits and an 8-bit membership mask in the high byte,
+// so a query can later be masked back to exactly its own selections. The final element of each
+// block row is the union length.
+void ggml_compute_forward_union_build(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * sel = dst->src[0];
+
+    const int32_t n_csa = ggml_get_op_params_i32(dst, 0);
+    const int32_t block = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t n_sel    = sel->ne[0];
+    const int64_t n_tokens = sel->ne[1];
+    const int64_t n_blocks = dst->ne[1];
+    const int64_t stride   = dst->ne[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    std::vector<uint8_t> memb(n_csa);
+
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        std::fill(memb.begin(), memb.end(), 0);
+
+        for (int64_t q = 0; q < block; ++q) {
+            const int64_t t = b*block + q;
+            if (t >= n_tokens) {
+                break;
+            }
+            const int32_t * src = (const int32_t *) ((const char *) sel->data + t*sel->nb[1]);
+            for (int64_t j = 0; j < n_sel; ++j) {
+                const int32_t id = src[j];
+                if (id >= 0 && id < n_csa) {
+                    memb[id] |= (uint8_t) (1u << q);
+                }
+            }
+        }
+
+        int32_t * out = (int32_t *) ((char *) dst->data + b*dst->nb[1]);
+        int64_t n = 0;
+        for (int32_t id = 0; id < n_csa; ++id) {
+            if (memb[id]) {
+                out[n++] = (int32_t) (((uint32_t) memb[id] << 24) | (uint32_t) id);
+            }
+        }
+        for (int64_t i = n; i < stride - 1; ++i) {
+            out[i] = 0;
+        }
+        out[stride - 1] = (int32_t) n;
+    }
+}
+
+// GGML_OP_FLASH_ATTN_UNION - reference implementation
+//
+// Query t sits at position t%Q of block t/Q. It attends the contiguous prefix [0, n_dense) plus
+// exactly those union entries whose membership bit (t%Q) is set - i.e. its OWN selections, which
+// is what makes the union exact rather than an approximation.
+void ggml_compute_forward_flash_attn_union(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * q    = dst->src[0];
+    const struct ggml_tensor * k    = dst->src[1];
+    const struct ggml_tensor * v    = dst->src[2];
+    const struct ggml_tensor * mask = dst->src[3];
+    const struct ggml_tensor * uids = dst->src[4];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    const float scale   = ggml_get_op_params_f32(dst, 0);
+    const int   n_dense = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t DK = q->ne[0];
+    const int64_t DV = v->ne[0];
+    const int64_t NQ = q->ne[1];   // queries
+    const int64_t NH = q->ne[2];   // heads
+    const int64_t Q  = 8;          // block size, must match the kernel
+
+    const int64_t stride = uids->ne[0];
+    const int64_t maxu   = stride - 1;
+
+    std::vector<float> sc;
+
+    for (int64_t h = 0; h < NH; ++h) {
+        const int64_t hk = h % k->ne[2];
+
+        for (int64_t t = 0; t < NQ; ++t) {
+            const int64_t b  = t / Q;
+            const int64_t qq = t % Q;
+
+            const int32_t * ub  = (const int32_t *) ((const char *) uids->data + b*uids->nb[1]);
+            const int32_t   ule = ub[maxu];
+
+            const float * qp = (const float *) ((const char *) q->data + t*q->nb[1] + h*q->nb[2]);
+
+            std::vector<int64_t> cols;
+            for (int64_t c = 0; c < n_dense; ++c) {
+                cols.push_back(c);
+            }
+            for (int64_t i = 0; i < ule; ++i) {
+                const uint32_t packed = (uint32_t) ub[i];
+                if (packed & (1u << (24 + qq))) {
+                    // union ids are CSA-relative: k is concat(dense prefix, csa)
+                    cols.push_back((int64_t) n_dense + (int64_t) (packed & 0xFFFFFFu));
+                }
+            }
+
+            sc.assign(cols.size(), 0.0f);
+            float mx = -INFINITY;
+            for (size_t c = 0; c < cols.size(); ++c) {
+                const ggml_fp16_t * kp = (const ggml_fp16_t *) ((const char *) k->data + cols[c]*k->nb[1] + hk*k->nb[2]);
+                float s = 0.0f;
+                for (int64_t d = 0; d < DK; ++d) {
+                    s += qp[d] * GGML_CPU_FP16_TO_FP32(kp[d]);
+                }
+                s *= scale;
+                // the dense prefix carries the ordinary (causal) mask; union entries do not
+                if (mask && cols[c] < n_dense) {
+                    const ggml_fp16_t * mp = (const ggml_fp16_t *) ((const char *) mask->data + t*mask->nb[1]);
+                    s += GGML_CPU_FP16_TO_FP32(mp[cols[c]]);
+                }
+                sc[c] = s;
+                mx = MAX(mx, s);
+            }
+
+            float sum = 0.0f;
+            for (size_t c = 0; c < cols.size(); ++c) {
+                sc[c] = expf(sc[c] - mx);
+                sum += sc[c];
+            }
+
+            float * op = (float *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[2]);
+            for (int64_t d = 0; d < DV; ++d) {
+                op[d] = 0.0f;
+            }
+            for (size_t c = 0; c < cols.size(); ++c) {
+                const ggml_fp16_t * vp = (const ggml_fp16_t *) ((const char *) v->data + cols[c]*v->nb[1] + hk*v->nb[2]);
+                const float w = sc[c]/sum;
+                for (int64_t d = 0; d < DV; ++d) {
+                    op[d] += w * GGML_CPU_FP16_TO_FP32(vp[d]);
+                }
+            }
+        }
+    }
+}

@@ -593,6 +593,13 @@ public:
     const llama_kv_cache_dsv4_raw_context * mctx;
 };
 
+// LLAMA_DSV4_SPARSE_GATHER=1 enables the DSV4 CSA sparse-gather path; 0 or unset disables it
+bool dsv4_sparse_gather_enabled();
+
+// the union-gather (n_tokens > 1) path is only valid for small spec-verify batches
+// (1 anchor + up to 5 draft tokens); larger batches fall back to the dense mask path
+static constexpr int32_t LLM_DSV4_UNION_GATHER_MAX_TOKENS = 6;
+
 class llm_graph_input_dsv4 : public llm_graph_input_i {
 public:
     struct comp_input {
@@ -609,14 +616,20 @@ public:
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
 
+        // structural union-gather mask for the CSA sparse-gather decode path (n_tokens > 1)
+        // [n_sel*n_tokens, n_tokens, 1, 1]; block-diagonal: mask_g[r][t] = (r/n_sel == t) ? 0 : -inf
+        ggml_tensor * mask_g     = nullptr;
+
         ggml_tensor * k_rot      = nullptr;
     };
 
     llm_graph_input_dsv4(
+            const llama_hparams & hparams,
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw,
             const llama_kv_cache_dsv4_context * mctx) :
         inp_raw(std::move(inp_raw)),
+        hparams(hparams),
         cparams(cparams),
         mctx(mctx) {
     }
@@ -637,6 +650,7 @@ public:
     comp_input inp_hca;
     comp_input inp_lid;
 
+    const llama_hparams hparams;
     const llama_cparams cparams;
 
     const llama_kv_cache_dsv4_context * mctx;

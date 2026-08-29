@@ -2022,6 +2022,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_FLASH_ATTN_UNION:
+            // union-8 is instantiated for the DSV4 MLA shape only
+            return op->src[1]->type == GGML_TYPE_F16 && op->src[4] &&
+                   op->src[0]->ne[0] == 512 && op->src[2]->ne[0] == 512;
+        case GGML_OP_UNION_BUILD:
+            // the kernel keeps the pooled-row bitmap in threadgroup memory: 65536 rows = 8 KB
+            return op->src[0]->type == GGML_TYPE_I32 &&
+                   ggml_get_op_params_i32(op, 0) <= 65536 &&
+                   ggml_get_op_params_i32(op, 1) <= 8;
         case GGML_OP_FLASH_ATTN_EXT:
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&

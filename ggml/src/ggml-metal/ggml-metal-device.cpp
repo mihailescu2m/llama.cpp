@@ -771,6 +771,60 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
+// same shape as the mul_mv_ext pipeline, but for MUL_MAT_ID: r1ptg bounds how many tokens one
+// expert can serve in a threadgroup, so it must be >= n_tokens
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_union(ggml_metal_library_t lib, const ggml_tensor * op, int nsg) {
+    char base[256];
+    char name[256];
+
+    const int32_t dk = (int32_t) op->src[1]->ne[0];
+    const int32_t dv = (int32_t) op->src[2]->ne[0];
+
+    const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
+    const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
+
+    snprintf(base, 256, "kernel_flash_attn_ext_union_%s_dk%d_dv%d", ggml_type_name(op->src[1]->type), dk, dv);
+    snprintf(name, 256, "%s_nsg=%d_ns10=%d_ns20=%d", base, nsg, ns10, ns20);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        // has_mask MUST be true: the union kernel writes its membership-derived mask inside that
+        // guard. blk is only read for dense chunks (guarded by !u), so no blk buffer is needed.
+        ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT + 20);
+        ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT + 21);
+        ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT + 22);
+        ggml_metal_cv_set_bool (cv, true,  FC_FLASH_ATTN_EXT + 0);  // has_mask
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 1);  // has_sinks
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 2);  // has_bias
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 3);  // has_scap
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 4);  // has_kvpad
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 10); // bc_mask
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_union_build(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_UNUSED(op);
+
+    char base[256];
+    snprintf(base, 256, "kernel_union_build");
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];

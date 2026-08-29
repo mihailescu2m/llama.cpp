@@ -24,6 +24,10 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
+// the graph node at index i of this op context's own (filtered) index space - GGML_METAL_OP_PROFILE
+// needs it to attribute a command buffer's GPU time to a ggml op
+struct ggml_tensor * ggml_metal_op_node_at(ggml_metal_op_t ctx, int i);
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 //
@@ -93,6 +97,8 @@ int ggml_metal_op_roll              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_arange            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_union_build      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flash_attn_union (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_moe_slot_resolve(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);

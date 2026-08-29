@@ -7074,6 +7074,128 @@ struct test_leaky_relu : public test_case {
 
 // GGML_OP_FLASH_ATTN_EXT
 // DeepSeek sparse attention: every query attends a dense prefix plus its own selected kv entries
+// GGML_OP_UNION_BUILD
+struct test_union_build : public test_case {
+    const int64_t n_sel;
+    const int64_t n_tokens;
+    const int64_t n_csa;
+    const int64_t block;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_sel, n_tokens, n_csa, block);
+    }
+
+    test_union_build(int64_t n_sel = 512, int64_t n_tokens = 64, int64_t n_csa = 4096, int64_t block = 8)
+        : n_sel(n_sel), n_tokens(n_tokens), n_csa(n_csa), block(block) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, n_tokens);
+        ggml_set_name(sel, "sel");
+
+        ggml_tensor * out = ggml_union_build(ctx, sel, n_csa, block);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    // selections must be DISTINCT within a query (top-k never repeats a row) and in [0, n_csa)
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                continue;
+            }
+
+            std::vector<int32_t> data(n_sel*n_tokens);
+            std::vector<int32_t> pool(n_csa);
+            for (int64_t i = 0; i < n_csa; ++i) {
+                pool[i] = (int32_t) i;
+            }
+
+            for (int64_t r = 0; r < n_tokens; ++r) {
+                std::shuffle(pool.begin(), pool.end(), rng);
+                for (int64_t j = 0; j < n_sel; ++j) {
+                    data[r*n_sel + j] = pool[j];
+                }
+            }
+
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+
+    double max_nmse_err() override { return 0.0; }
+};
+
+// GGML_OP_FLASH_ATTN_UNION
+struct test_flash_attn_union : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t nr2;
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t n_sel;
+    const int64_t n_dense;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, nh, nr2, kv, nb, n_sel, n_dense, uniform);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool uniform = false;   // all queries in a block select the SAME columns (membership all 0xFF)
+
+    test_flash_attn_union(int64_t hs = 512, int64_t nh = 1, int64_t nr2 = 64, int64_t kv = 2048,
+                          int64_t nb = 64, int64_t n_sel = 128, int64_t n_dense = 0, bool uniform = false)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), n_sel(n_sel), n_dense(n_dense), uniform(uniform) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr2, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, nb);
+        ggml_set_name(sel, "sel");
+
+        ggml_tensor * uids = ggml_union_build(ctx, sel, kv - n_dense, 8);
+        ggml_set_name(uids, "uids");
+
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_flash_attn_union(ctx, q, k, v, mask, uids, n_dense, 1.0f/sqrtf(hs));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(n_sel*nb);
+                const int64_t n_csa = kv - n_dense;
+                std::vector<int32_t> pool(n_csa);
+                for (int64_t i = 0; i < n_csa; ++i) pool[i] = (int32_t) i;
+                for (int64_t r = 0; r < nb; ++r) {
+                    if (!uniform || r % 8 == 0) {
+                        std::shuffle(pool.begin(), pool.end(), rng);
+                    }
+                    for (int64_t j = 0; j < n_sel; ++j) data[r*n_sel + j] = pool[j];
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
     const int64_t hsv; // V head size
@@ -9368,11 +9490,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
     }
 
-    // For issue 27873
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
 
-    for (int k : {1, 63, 65}) {
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
+    // union-8 attention: verified against the CPU reference, which attends exactly the columns
+    // whose membership bit is set - so any indexing or masking error shows up immediately
+    // bisection: n_sel == kv means every query selects EVERY column, so the union is the full KV
+    // and the result must equal plain dense attention. Failing here isolates the indirection;
+    // passing here isolates the membership masking.
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 512, 8, 512, 0));
+    // partial union but UNIFORM membership: isolates per-query bit selection from union padding
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 1024, 64, 64, 0, true));
+    // n_dense > 0 exercises the TWO-PHASE loop: contiguous masked prefix, then the union region
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 1024, 64, 64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 2048, 64, 128, 256, false));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 512, 64, 512, 0));
+
+    for (int64_t kv : {1024, 2048}) {
+        for (int64_t n_sel : {64, 128}) {
+            test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, kv, 64, n_sel, 0));
+        }
+    }
+
+    // union-8 builder: the union must be EXACT (no dropped selection would be silent), so this is
+    // checked against the CPU reference across block sizes and pool sizes
+    for (int64_t n_csa : {1024, 4096, 32768}) {
+        for (int64_t block : {4, 8}) {
+            test_cases.emplace_back(new test_union_build(512, 64, n_csa, block));
+        }
+    }
+    test_cases.emplace_back(new test_union_build(512, 4096, 8192, 8));
+
+    // MoE small-batch mat-vec (GGML_METAL_MV_ID_EXT): exercises 2..8 tokens sharing experts, which
+    // the n=1 / n=32 cases above never reach
+    for (int n : {2, 3, 4, 5, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 256, n, 256));
+        }
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
@@ -10363,6 +10516,60 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // deepseek-v4-flash: 256 experts, 6 used, gate/up [4096,2048] and down [2048,4096].
+    // bs 1-2 is decode (2 with n_max=1 speculation); the quant types are the ones the shipped
+    // checkpoints actually use for experts, plus the k-quant candidates.
+    for (int bs : {1, 2}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                                 GGML_TYPE_MXFP4, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, bs, 4096));
+        }
+    }
+
+    // union-8 ATTENTION vs the dense FLASH_ATTN_EXT it replaces, same kv/nb.
+    // NOTE the synthetic union is much larger than the real one: random selections give
+    // union ~3300 at kv=8192, where real DSV4 routing gives ~1434 because the 8 queries agree.
+    // So this UNDERSTATES the real win.
+    for (int64_t kv : {4096, 8192, 16384, 32768, 65536}) {
+        test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, kv, 1024, 512, 0));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // union-8 builder at the real prefill shape: one ubatch of 4096 tokens, blocks of 8.
+    // Compare against the CSA attention it would feed (~1.0 s per layer at n_csa=8192, nb=4096).
+    for (int64_t n_csa : {4096, 8192, 16384, 32768}) {
+        test_cases.emplace_back(new test_union_build(512, 4096, n_csa, 8));
+    }
+
+    // Small-batch MoE mat-vec (GGML_METAL_MV_ID_EXT) only pays when tokens SHARE an expert.
+    // test-backend-ops picks ids at random, so n_mats sets the sharing rate: at 256 experts / 6
+    // used two tokens share ~0.14 experts (none), at 32 ~1.1, at 8 ~4.5. Real DSV4 routing overlaps
+    // ~72% of the top-6, so the n_mats=8 row is the closest analogue. These are also far lighter
+    // than the 256-expert case (26 MB and 103 MB of src0 vs 822 MB), which matters because the big
+    // one can push a 64 GB machine into swap.
+    for (int bs : {1, 2, 3, 4, 6, 8}) {
+        for (int n_mats : {8, 32}) {
+            for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, 6, false, 2048, bs, 4096));
+            }
+        }
+    }
+
+    // n-curve over the same expert shape. The weight bytes read are CONSTANT in bs (6 of 256
+    // experts either way), so a flat curve means the kernel is weight-bandwidth-bound and deeper
+    // speculative batches amortise the read; a rising curve means occupancy/latency-bound instead.
+    // gate/up [4096,2048] and down [2048,4096] carry the same bytes, so both are measured.
+    for (int bs : {3, 4, 6, 8, 12, 16, 24, 32}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, bs, 4096));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048));
+    }
+
+    for (int bs : {1, 2}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048));
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
@@ -10558,6 +10765,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // DSV4 PREFILL ATTRIBUTION: the two candidates for the prefill quadratic, measured at the SAME
+    // context points so they can be compared directly. n_csa = ctx/4, so these cover ctx 16k..128k.
+    // Both ops are O(n_tokens * n_csa), so the SPLIT is independent of n_tokens - nb=1024 is used
+    // instead of the real 4096 ubatch purely to keep peak memory near 270 MB.
+    // Scale by layer count afterwards: the indexer runs in 21 layers, CSA attention in 24.
+    for (int64_t n_csa : { 4096, 8192, 16384, 32768 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, n_csa, 1024, 1, 1, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, n_csa, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // UNION-8 GATE: the tiled FA kernel reaches ~1150 GF only via simdgroup_load of 8 CONTIGUOUS
+    // columns from global memory. Union columns are scattered, so the sparse region must stage K
+    // into threadgroup memory instead - the same path the QUANTIZED branch already takes. Measuring
+    // f16 (direct load) against quantized K at our shape prices that staging before any kernel is
+    // written: union-8 only wins if the staged path clears ~408 GF.
+    for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, 1024, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+    }
+
+    // DECODE shape (nb=1, the VEC kernel) for the same KV types: quantised KV measured ~2x slower
+    // end-to-end at decode, and the q8_0 vec kernel DOES exist at dk512, so this asks whether the
+    // cost is inherent to the vec path rather than a missing-kernel fallback.
+    for (int64_t kv : { 8192, 32768 }) {
+        for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+        }
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {

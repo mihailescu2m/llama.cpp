@@ -591,6 +591,8 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_MOE_SLOT_RESOLVE,
+        GGML_OP_UNION_BUILD,
+        GGML_OP_FLASH_ATTN_UNION,
 
         GGML_OP_COUNT,
     };
@@ -2416,6 +2418,41 @@ extern "C" {
             int                   n_slots,
             int                   layer,
             int                   mode);
+
+    // union-8 support: dedup the top-k selections of a BLOCK of queries into one shared list.
+    // sel is I32 [n_sel, n_tokens]; the result is I32 [max_union + 1, n_blocks] where each entry
+    // packs the pooled row id in the low 24 bits and an 8-bit membership mask in the high byte
+    // (bit q set = query q of this block selected that row). The last element of each block row
+    // holds the union length. Blocks are ceil(n_tokens/block).
+    // union-8 attention: q attends the contiguous prefix [0, n_dense) plus, for its block, only
+    // the union entries whose membership bit is set. uids comes from ggml_union_build.
+    GGML_API struct ggml_tensor * ggml_flash_attn_union(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * uids,
+            int                   n_dense,
+            float                 scale);
+
+    GGML_API struct ggml_tensor * ggml_union_build(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sel,
+            int                   n_csa,
+            int                   block);
+
+    GGML_API struct ggml_tensor * ggml_flash_attn_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * idx,
+            int                   n_dense,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
 
     // top k elements per row
     // note: the resulting top k indices are in no particular order
