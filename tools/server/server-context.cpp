@@ -26,6 +26,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <list>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -37,6 +38,126 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// ---------------------------------------------------------------------------------------------
+// Context checkpoints alongside a saved slot.
+//
+// llama_state_seq_save_file stores the sequence's KV, but NOT the server's context checkpoints,
+// which live only in slot.prompt.checkpoints. For an SWA model that makes a restored slot unusable:
+// the KV only retains the last n_swa positions, so the reuse path finds pos_min >= pos_min_thold,
+// looks for a checkpoint to fall back to, finds none, and logs "forcing full prompt re-processing
+// due to lack of cache data" - a full re-prefill even when the prompt matches byte for byte.
+// Measured on DeepSeek-V4-Flash: an identical prompt reused 4 tokens in-process but re-prefilled all
+// 3804 in 40 s after a save/restart/restore cycle.
+//
+// These go in a SIDECAR file rather than extending the state file: that format belongs to libllama,
+// and a sidecar cannot corrupt it, needs no library change, and lets a save file written without
+// checkpoints (or by upstream) still load - it just degrades to the old behaviour.
+// ---------------------------------------------------------------------------------------------
+
+static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x4b435453; // "STCK"
+static constexpr uint32_t SLOT_CKPT_VERSION = 1;
+static constexpr uint32_t SLOT_CKPT_MAX     = 64;         // sanity bound against a corrupt file
+static constexpr uint64_t SLOT_CKPT_MAX_BLOB = 4ull << 30;
+
+static std::string slot_ckpt_path(const std::string & filepath) {
+    return filepath + ".ckpt";
+}
+
+template <typename T> static void slot_ckpt_w(std::ofstream & f, const T & v) {
+    f.write(reinterpret_cast<const char *>(&v), sizeof(T));
+}
+
+template <typename T> static bool slot_ckpt_r(std::ifstream & f, T & v) {
+    return (bool) f.read(reinterpret_cast<char *>(&v), sizeof(T));
+}
+
+static void slot_ckpt_w_blob(std::ofstream & f, const std::vector<uint8_t> & b) {
+    const uint64_t n = b.size();
+    slot_ckpt_w(f, n);
+    if (n > 0) {
+        f.write(reinterpret_cast<const char *>(b.data()), n);
+    }
+}
+
+static bool slot_ckpt_r_blob(std::ifstream & f, std::vector<uint8_t> & b) {
+    uint64_t n = 0;
+    if (!slot_ckpt_r(f, n) || n > SLOT_CKPT_MAX_BLOB) {
+        return false;
+    }
+    b.resize(n);
+    return n == 0 || (bool) f.read(reinterpret_cast<char *>(b.data()), n);
+}
+
+// returns bytes written, 0 if there was nothing to write or the write failed (never fatal - the
+// slot's KV is already saved and a missing sidecar only costs a re-prefill)
+static size_t slot_ckpt_save(const std::string & filepath, const std::list<common_prompt_checkpoint> & cks) {
+    if (cks.empty()) {
+        return 0;
+    }
+    std::ofstream f(slot_ckpt_path(filepath), std::ios::binary | std::ios::trunc);
+    if (!f) {
+        return 0;
+    }
+    slot_ckpt_w(f, SLOT_CKPT_MAGIC);
+    slot_ckpt_w(f, SLOT_CKPT_VERSION);
+    slot_ckpt_w(f, (uint32_t) std::min<size_t>(cks.size(), SLOT_CKPT_MAX));
+
+    uint32_t n = 0;
+    for (const auto & c : cks) {
+        if (n++ >= SLOT_CKPT_MAX) {
+            break;
+        }
+        slot_ckpt_w(f, (int64_t) c.n_tokens);
+        slot_ckpt_w(f, (int32_t) c.pos_min);
+        slot_ckpt_w(f, (int32_t) c.pos_max);
+        slot_ckpt_w_blob(f, c.data_tgt);
+        slot_ckpt_w_blob(f, c.data_dft);
+        slot_ckpt_w_blob(f, c.data_spec);
+    }
+    if (!f) {
+        return 0;
+    }
+    return (size_t) f.tellp();
+}
+
+// best-effort: any failure leaves cks empty, which is exactly the pre-patch behaviour
+static void slot_ckpt_load(const std::string & filepath, std::list<common_prompt_checkpoint> & cks) {
+    cks.clear();
+
+    std::ifstream f(slot_ckpt_path(filepath), std::ios::binary);
+    if (!f) {
+        return;
+    }
+    uint32_t magic = 0, version = 0, count = 0;
+    if (!slot_ckpt_r(f, magic) || magic != SLOT_CKPT_MAGIC) {
+        return;
+    }
+    if (!slot_ckpt_r(f, version) || version != SLOT_CKPT_VERSION) {
+        return;
+    }
+    if (!slot_ckpt_r(f, count) || count > SLOT_CKPT_MAX) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        common_prompt_checkpoint c;
+        int64_t n_tokens = 0;
+        int32_t pos_min = 0, pos_max = 0;
+        if (!slot_ckpt_r(f, n_tokens) || !slot_ckpt_r(f, pos_min) || !slot_ckpt_r(f, pos_max)) {
+            cks.clear();
+            return;
+        }
+        if (!slot_ckpt_r_blob(f, c.data_tgt) || !slot_ckpt_r_blob(f, c.data_dft) || !slot_ckpt_r_blob(f, c.data_spec)) {
+            cks.clear();
+            return;
+        }
+        c.n_tokens = n_tokens;
+        c.pos_min  = pos_min;
+        c.pos_max  = pos_max;
+        cks.push_back(std::move(c));
+    }
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -2568,6 +2689,11 @@ private:
                         break;
                     }
 
+                    // the KV alone is not enough to resume an SWA model - see slot_ckpt_save
+                    const size_t nwrite_ckpt = slot_ckpt_save(filepath, slot->prompt.checkpoints);
+                    SRV_INF("slot save: %zu checkpoint(s), %.2f MiB sidecar\n",
+                            slot->prompt.checkpoints.size(), (float) nwrite_ckpt / 1024 / 1024);
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2627,6 +2753,13 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // Without these the reuse path has no fallback when the SWA window no longer
+                        // covers the prefix, and resets n_past to 0 - a full re-prefill even for a
+                        // byte-identical prompt. Best-effort: an absent or stale sidecar just leaves
+                        // the list empty, i.e. the behaviour before this was persisted.
+                        slot_ckpt_load(filepath, slot->prompt.checkpoints);
+                        SRV_INF("slot restore: %zu checkpoint(s) recovered\n", slot->prompt.checkpoints.size());
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
