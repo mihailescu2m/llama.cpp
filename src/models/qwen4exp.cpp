@@ -229,9 +229,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
+    // the metal backend fuses NORM->MUL, but the check is `norm != mul->src[0]`, a tensor
+    // identity test. reshaping between the two makes mul->src[0] the reshape and breaks the
+    // fusion, spilling the norm result to memory. reshape the [hc_dim] gamma instead.
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    xn = ggml_mul(ctx0, xn, ggml_reshape_2d(ctx0, w_norm, n_embd, hc));
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -243,14 +246,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
+    // no ggml_cont on the first stream: ADD only needs contiguous *rows*, which a dim-1 strided
+    // view already satisfies, and it allocates a contiguous dst anyway. the adds then chain-fuse.
+    ggml_tensor * mixed = nullptr;
+    for (int64_t c = 0; c < hc; ++c) {
         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
                 ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
+        mixed = mixed ? ggml_add(ctx0, mixed, s) : s;
     }
     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     cb(mixed, "hc_mixed", il);
@@ -1078,22 +1081,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    // cont the transposed activations first: concat's non-contiguous path is an order of
+    // magnitude slower on large prefill chunks
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_cont(ctx0, ggml_transpose(ctx0, x)), 0);
 
     // keep the last state_cols columns for the next ubatch
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
 
-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-            state_cols, channels, n_seqs,
-            conv_input->nb[1], conv_input->nb[2],
-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+    const auto mem_size = mctx_cur->get_size();
 
-    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-            state_cols * channels, n_seqs,
-            conv_states_all->nb[1],
-            kv_head * row_size);
+    if (cparams.n_rs_seq == 0) {
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, n_seqs,
+                conv_states_all->nb[1],
+                kv_head * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    } else {
+        // [TAG_RECURRENT_ROLLBACK_SPLITS]
+        // with the rollback ring enabled the cache holds (1 + n_rs_seq) banks of mem_size
+        // cells, and the state as of each of the last K = n_rs_seq + 1 tokens must be
+        // written to its bank (snapshot slot K - t -> rollback group K - t). without this
+        // banks 1..K stay zeroed and every rollback feeds the GDN and PLE convolutions a
+        // zeroed history, corrupting generation.
+        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - state_cols - K + t);
+            const int64_t s_slot = K - t;
+
+            ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                    state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, s_idx));
+
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                    state_cols * channels, n_seqs,
+                    conv_states_all->nb[1],
+                    (s_slot * mem_size + kv_head) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        }
+    }
 
     return conv_input;
 }
