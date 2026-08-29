@@ -160,6 +160,24 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
     if (const char * s = std::getenv("LLAMA_MOE_STREAM_STATS_MS")) {
         stats_dump_us = std::max<int64_t>(0, std::atoll(s))*1000;
     }
+
+    // MUST be read here and not in open_files: create_cache_tensor decides whether to allocate the
+    // GPU residency table, and it runs while the model's tensors are being loaded - long before
+    // open_files. Parsing this late silently disabled the whole feature.
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_GPU_SLOT")) {
+        gpu_slot = std::max(0, atoi(s));
+    }
+
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_LRU")) {
+        pure_lru = atoi(s) != 0; // an EMPTY value must mean off, not on
+    }
+
+    // enough to keep every reader busy a few slabs deep, not so much that a prefetch is still
+    // queued when its layer arrives
+    q_spec_max = (size_t) this->n_io_threads * 8;
+    if (const char * s = std::getenv("LLAMA_MOE_STREAM_SPEC_MAX")) {
+        q_spec_max = (size_t) std::max(0, atoi(s));
+    }
 }
 
 // stop and join the I/O workers before the cache buffers and files they use are destroyed
@@ -168,6 +186,7 @@ llama_moe_stream::~llama_moe_stream() {
         std::lock_guard<std::mutex> lock(mtx);
         shutting_down = true;
         q_demand.clear();
+        q_spec.clear();
     }
     cv_work.notify_all();
     for (auto & w : workers) {
@@ -226,6 +245,25 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->route_hotness.resize(n_expert, 0);
         sl->seen         .resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
+
+        if (gpu_slot) {
+            if (!ctx_state) {
+                ggml_init_params sp = {
+                    /*.mem_size   =*/ ggml_tensor_overhead()*(layers.size() + 1),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ctx_state.reset(ggml_init(sp));
+                if (!ctx_state) {
+                    throw std::runtime_error("failed to create ggml context for MoE slot state");
+                }
+                buft_state = buft;
+            }
+            GGML_ASSERT(buft_state == buft);
+            const llama_moe_slot_state_layout lay = { (int32_t) n_expert, (int32_t) n_slots };
+            sl->state = ggml_new_tensor_1d(ctx_state.get(), GGML_TYPE_I32, lay.size());
+            ggml_format_name(sl->state, "blk.%d.stream_slot_state", il);
+        }
     }
     GGML_ASSERT(sl->n_expert == n_expert);
 
@@ -237,6 +275,40 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
 }
 
 void llama_moe_stream::alloc_bufs(bool no_alloc) {
+    if (ctx_state && ggml_get_first_tensor(ctx_state.get()) != nullptr) {
+        ggml_backend_buffer_t buf;
+        if (no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft_state, /*size =*/ 0);
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_state.get()); t != nullptr;
+                    t = ggml_get_next_tensor(ctx_state.get(), t)) {
+                t->buffer = buf;
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_state.get(), buft_state);
+        }
+        if (buf == nullptr) {
+            throw std::runtime_error("unable to allocate the MoE slot state buffer");
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        buf_state.reset(buf);
+
+        // the buffer starts as whatever was in memory; the kernel would read that as residency
+        for (auto & sl : layers) {
+            if (!sl || !sl->state) {
+                continue;
+            }
+            auto * host = (int32_t *) ggml_backend_tensor_get_host_ptr(sl->state);
+            if (host == nullptr) {
+                continue;
+            }
+            const llama_moe_slot_state_layout lay = sl->layout();
+            std::fill(host, host + lay.off_tail(), -1);
+            std::fill(host + lay.off_tail(), host + lay.size(), 0);
+            sl->state_host = host;
+            sl->state_init = true;
+        }
+    }
+
     for (auto & [buft, ctx_ptr] : ctxs) {
         ggml_context * ctx = ctx_ptr.get();
         if (ggml_get_first_tensor(ctx) == nullptr) {
@@ -363,13 +435,20 @@ void llama_moe_stream::worker_loop() {
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty(); });
+        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_spec.empty(); });
         if (shutting_down) {
             break;
         }
 
-        llama_moe_stream_work w = q_demand.front();
-        q_demand.pop_front();
+        // demand first, always: a layer is blocked on those, nothing is blocked on a prefetch
+        llama_moe_stream_work w;
+        if (!q_demand.empty()) {
+            w = q_demand.front();
+            q_demand.pop_front();
+        } else {
+            w = q_spec.front();
+            q_spec.pop_front();
+        }
 
         auto & sl = *w.sl;
         // no per-slot exclusion: several workers legitimately hold different slabs of the SAME slot
@@ -457,6 +536,15 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const 
         }
         if (v < 0) {
             v = s;
+            continue;
+        }
+        // Pure LRU is what the GPU can own: victim selection collapses to an argmin over
+        // slot_last_use, with no per-expert hotness table to keep in sync. Replay of real routing
+        // put the cost at +11% misses; measure it here before building the kernel.
+        if (pure_lru) {
+            if (sl.slot_last_use[s] < sl.slot_last_use[v]) {
+                v = s;
+            }
             continue;
         }
         const uint32_t hs = sl.route_hotness[sl.slot_expert[s]];
@@ -577,6 +665,11 @@ void llama_moe_stream::maybe_dump_stats_locked() {
                     __func__, hist, d_sl > 0 ? 100.0*fast/d_sl : 0.0);
         }
 
+        if (n_slot_chk > 0) {
+            LLAMA_LOG_WARN("%s: moe stream: gpu slot resolve verified %" PRId64 " calls, %" PRId64 " mismatches\n",
+                    __func__, n_slot_chk, n_slot_bad);
+        }
+
         if (stats.chunk_util_max > 0) {
             LLAMA_LOG_WARN("%s: moe stream: chunk utilisation worst = %" PRId64 "%% (100%% = abort)\n",
                     __func__, stats.chunk_util_max);
@@ -607,6 +700,10 @@ void llama_moe_stream::print_stats() const {
         LLAMA_LOG_WARN("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
     }
+    if (n_slot_chk > 0) {
+        LLAMA_LOG_WARN("%s: moe stream: gpu slot resolve = %" PRId64 " calls verified, %" PRId64 " mismatches\n",
+                __func__, n_slot_chk, n_slot_bad);
+    }
     if (stats.n_slabs_read > 0) {
         for (int b = 0; b < MOE_STREAM_READ_BUCKETS; b++) {
             const int64_t lo = b ? MOE_STREAM_READ_BUCKET_US[b-1] : 0;
@@ -627,6 +724,145 @@ void llama_moe_stream::print_stats() const {
 // then rewrite each id to its cache slot. this only relabels ids, so the same experts are computed
 // in the same order; the result matches a non-streamed run (bit-exact when both paths use the same
 // kernels, as on CUDA; a CPU build that repacks the non-streamed weights can differ in the last bits).
+// Mirror the CPU's residency into the device table the resolve kernel reads, and collect what the
+// kernel reported since the last call.
+//
+// At mode 3 the GPU owns this table between calls, but the CPU path still runs for prefill (see
+// LLAMA_MOE_GPU_SLOT_MAX_TOKENS), so every CPU-path call republishes the whole thing. That is what
+// keeps the handover consistent in both directions: the servicer mirrors every GPU assignment back
+// into the CPU structures, and this mirrors the CPU structures back out.
+void llama_moe_stream_layer::publish_state_locked(llama_moe_stream & mgr) {
+    if (state_host == nullptr) {
+        state_host = (int32_t *) ggml_backend_tensor_get_host_ptr(state);
+        if (state_host == nullptr) {
+            return;
+        }
+    }
+
+    const llama_moe_slot_state_layout lay = layout();
+
+    int32_t * se   = state_host + lay.off_slot_expert();
+    int32_t * lu   = state_host + lay.off_last_use();
+    int32_t * es   = state_host + lay.off_expert_slot();
+    int32_t * tail = state_host + lay.off_tail();
+
+    if (state_init && tail[MOE_SLOT_TAIL_NBAD] != 0) {
+        if (mgr.n_slot_warn < 8) {
+            mgr.n_slot_warn++;
+            LLAMA_LOG_WARN("%s: moe stream: GPU slot resolve DISAGREES with the CPU remap "
+                    "(layer %d, %d pairs) - the CPU answer is still what is used\n",
+                    __func__, il, tail[MOE_SLOT_TAIL_NBAD]);
+        }
+        mgr.n_slot_bad += tail[MOE_SLOT_TAIL_NBAD];
+    }
+    state_init = true;
+
+    for (uint32_t s = 0; s < n_slots; s++) {
+        se[s] = slot_state[s] == LLAMA_MOE_STREAM_SLOT_EMPTY ? -1 : slot_expert[s];
+        lu[s] = (int32_t) slot_last_use[s];
+    }
+    std::fill(es, es + n_expert, -1);
+    for (const auto & [e, sl] : expert_slot) {
+        es[e] = sl;
+    }
+
+    tail[MOE_SLOT_TAIL_CLOCK] = (int32_t) use_counter;
+    tail[MOE_SLOT_TAIL_NREQ]  = 0;
+    tail[MOE_SLOT_TAIL_NBAD]  = 0;
+}
+
+// Load whatever the resolve kernel decided it needs. Runs on Metal's listener queue with the GPU
+// stalled on a shared event, so this is the whole of the CPU's job at mode 3 - the kernel already
+// chose the slots and wrote the ids the GEMM will use.
+void llama_moe_stream_layer::service_requests(llama_moe_stream & mgr) {
+    if (state_host == nullptr) {
+        state_host = (int32_t *) ggml_backend_tensor_get_host_ptr(state);
+        if (state_host == nullptr) {
+            return;
+        }
+    }
+
+    const llama_moe_slot_state_layout lay = layout();
+
+    int32_t *       tail = state_host + lay.off_tail();
+    const int32_t * req  = state_host + lay.off_requests();
+
+    const int32_t nreq = tail[MOE_SLOT_TAIL_NREQ];
+
+    std::unique_lock<std::mutex> lk(mgr.mtx);
+
+    if (tail[MOE_SLOT_TAIL_NBAD] != 0) {
+        // the kernel ran out of evictable slots, or saw an out-of-range expert id
+        mgr.load_failed = true;
+        mgr.cv_done.notify_all();
+        return;
+    }
+
+    mgr.stats.n_calls++;
+    mgr.maybe_dump_stats_locked();
+
+    if (nreq <= 0) {
+        return;
+    }
+
+    mgr.start_workers_locked();
+
+    const int64_t t0 = ggml_time_us();
+
+    demand_slots.clear();
+
+    for (int32_t i = 0; i < nreq; i++) {
+        const int32_t e = req[2*i + 0];
+        const int32_t s = req[2*i + 1];
+
+        if (e < 0 || (uint32_t) e >= n_expert || s < 0 || (uint32_t) s >= n_slots) {
+            mgr.load_failed = true;
+            mgr.cv_done.notify_all();
+            return;
+        }
+
+        if (!seen[e]) {
+            mgr.stats.n_miss_cold++;
+        }
+
+        // mirror the GPU's decision so the reader threads and a later CPU-path call agree with it
+        mgr.reserve_slot_locked(*this, e, s);
+
+        slot_pending[s] = (uint8_t) weights.size();
+        for (size_t wi = 0; wi < weights.size(); wi++) {
+            mgr.q_demand.push_back({ this, e, s, (int32_t) wi, slot_gen[s] });
+            mgr.cv_work.notify_one();
+        }
+
+        mgr.stats.n_miss++;
+        demand_slots.push_back(s);
+    }
+
+    mgr.cv_done.wait(lk, [&]{
+        if (mgr.load_failed) {
+            return true;
+        }
+        for (const int32_t s : demand_slots) {
+            if (slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+                return false;
+            }
+        }
+        return true;
+    });
+
+    mgr.stats.t_stall_us += ggml_time_us() - t0;
+}
+
+void llama_moe_stream_service_gpu(void * user_data, void * state_host, int32_t layer) {
+    GGML_UNUSED(state_host);
+
+    auto * mgr = (llama_moe_stream *) user_data;
+
+    if (llama_moe_stream_layer * sl = mgr->layer(layer)) {
+        sl->service_requests(*mgr);
+    }
+}
+
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
     GGML_UNUSED(nth);
     if (ith != 0) {
@@ -777,6 +1013,11 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         out[i] = s;
     }
 
+    if (mgr->gpu_slot) {
+        sl->publish_state_locked(*mgr);
+        mgr->n_slot_chk++;
+    }
+
     mgr->stats.t_remap_op_us += ggml_time_us() - t_op0;
 }
 
@@ -862,7 +1103,7 @@ void llama_moe_stream_prefetch_hash(ggml_tensor * dst, const ggml_tensor * a, in
             mgr->reserve_slot_locked(sl, e, v);
             sl.slot_pending[v] = (uint8_t) sl.weights.size();
             for (size_t wi = 0; wi < sl.weights.size(); wi++) {
-                mgr->q_demand.push_back({ &sl, e, v, (int32_t) wi, sl.slot_gen[v] });
+                mgr->q_spec.push_back({ &sl, e, v, (int32_t) wi, sl.slot_gen[v] });
                 mgr->cv_work.notify_one();
             }
             mgr->stats.n_preload_issued++;
@@ -899,6 +1140,9 @@ static void llama_moe_stream_prefetch_next(llama_moe_stream_lookahead * la, cons
         if (sl.expert_slot.find((int32_t) best) != sl.expert_slot.end()) {
             continue;                  // already resident or in flight - the common case
         }
+        if (mgr->q_spec.size() >= mgr->q_spec_max) {
+            break;                     // backlog already deeper than the drive will clear in time
+        }
         const int32_t v = mgr->pick_victim_locked(sl, nullptr);
         if (v < 0) {
             break;                     // every slot busy; the layer's own remap will demand-load it
@@ -906,7 +1150,7 @@ static void llama_moe_stream_prefetch_next(llama_moe_stream_lookahead * la, cons
         mgr->reserve_slot_locked(sl, (int32_t) best, v);
         sl.slot_pending[v] = (uint8_t) sl.weights.size();
         for (size_t wi = 0; wi < sl.weights.size(); wi++) {
-            mgr->q_demand.push_back({ &sl, (int32_t) best, v, (int32_t) wi, sl.slot_gen[v] });
+            mgr->q_spec.push_back({ &sl, (int32_t) best, v, (int32_t) wi, sl.slot_gen[v] });
             mgr->cv_work.notify_one();
         }
         mgr->stats.n_preload_issued++;

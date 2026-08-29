@@ -2215,20 +2215,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (msl && n_stream_waves == 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
 
-        // One-layer-ahead prefetch: predict the NEXT layer's routing from THIS layer's router input
-        // and hand it to the same custom op, so the lookahead costs no extra graph split. The
-        // prediction skips the attention and FFN terms between the layers - a lower bound, but the
-        // exact version would need layer L+1's attention output, i.e. attention twice per layer.
-        if (msl->la && msl->la->sl_next && msl->la_gate_inp) {
-            ggml_tensor * la_logits = ggml_mul_mat(ctx0, msl->la_gate_inp, cur);
-            ggml_mul_mat_set_prec(la_logits, GGML_PREC_F32);
-            cb(la_logits, "ffn_moe_logits_next", il);
+        // The GPU owns residency: no CPU op, so no graph split. The kernel resolves hits from its
+        // device table, evicts by least-recent use for misses and hands the slot list to a servicer
+        // over a shared event. Only for small ubatches - prefill keeps the CPU path.
 
-            ids_gemm = ggml_map_custom2(ctx0, ids_cont, la_logits, llama_moe_stream_remap_la, 1, msl->la);
+        if (msl->mgr->gpu_slot >= 3 && msl->state && n_tokens <= LLAMA_MOE_GPU_SLOT_MAX_TOKENS) {
+            ids_gemm = ggml_moe_slot_resolve(ctx0, ids_cont, msl->state, nullptr,
+                    msl->n_expert, msl->n_slots, il, msl->mgr->gpu_slot);
+            cb(ids_gemm, "ffn_moe_topk_gpu", il);
+
         } else {
-            ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+            // One-layer-ahead prefetch: predict the NEXT layer's routing from THIS layer's router
+            // input and hand it to the same custom op, so the lookahead costs no extra graph split.
+            // The prediction skips the attention and FFN terms between the layers - a lower bound,
+            // but the exact version would need layer L+1's attention output, i.e. attention twice
+            // per layer.
+            if (msl->la && msl->la->sl_next && msl->la_gate_inp) {
+                ggml_tensor * la_logits = ggml_mul_mat(ctx0, msl->la_gate_inp, cur);
+                ggml_mul_mat_set_prec(la_logits, GGML_PREC_F32);
+                cb(la_logits, "ffn_moe_logits_next", il);
+
+                ids_gemm = ggml_map_custom2(ctx0, ids_cont, la_logits, llama_moe_stream_remap_la, 1, msl->la);
+            } else {
+                ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+            }
+            cb(ids_gemm, "ffn_moe_topk_stream", il);
+
+            // GPU slot resolution, verify stage: resolve the same ids from the device table and
+            // check the answer against the CPU remap's, which is still what reaches the GEMM.
+            // Taking the remap output as src[2] is also what orders the kernel after it.
+            if (msl->mgr->gpu_slot == 1 && msl->state) {
+                ids_gemm = ggml_moe_slot_resolve(ctx0, ids_cont, msl->state, ids_gemm,
+                        msl->n_expert, msl->n_slots, il, 1);
+                cb(ids_gemm, "ffn_moe_topk_gpu", il);
+            }
         }
-        cb(ids_gemm, "ffn_moe_topk_stream", il);
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);

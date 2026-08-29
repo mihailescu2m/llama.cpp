@@ -631,6 +631,14 @@ bool ggml_backend_is_metal(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_metal_guid());
 }
 
+void ggml_backend_metal_set_moe_servicer(ggml_backend_t backend, ggml_backend_metal_moe_servicer_t fn, void * user_data) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_set_moe_servicer(ctx, (ggml_metal_moe_servicer_t) fn, user_data);
+}
+
 void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 

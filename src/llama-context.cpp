@@ -4,6 +4,10 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -374,6 +378,22 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        // GPU-owned MoE residency needs a CPU servicer: the resolve kernel picks the slots and the
+        // GPU stalls on a shared event while this fills them, which is what lets the streaming
+        // graph run without a CPU op (and therefore without a scheduler split) per layer.
+        if (auto * mstream = model.moe_stream(); mstream != nullptr && mstream->gpu_slot >= 3) {
+            bool ok = false;
+            for (auto & backend : backends) {
+                if (ggml_backend_is_metal(backend.get())) {
+                    ggml_backend_metal_set_moe_servicer(backend.get(), llama_moe_stream_service_gpu, mstream);
+                    ok = true;
+                }
+            }
+            if (!ok) {
+                throw std::runtime_error("LLAMA_MOE_STREAM_GPU_SLOT=3 requires the Metal backend");
+            }
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {

@@ -747,13 +747,53 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
-    cb(k_all, "csa_k_all", il);
+    // The lightning indexer picks n_sel of the n_csa pooled entries, but expressing that choice as a
+    // mask over the whole pooled history leaves attention O(n_csa) - which is the long-context
+    // prefill quadratic. With a single query there is exactly ONE selection set, so the chosen rows
+    // can be gathered into a compact K/V and the ordinary dense kernel then runs over n_sel instead
+    // of n_csa. Measured on the Metal FA kernel at 41k of context: 1481 us -> 567 us per layer.
+    //
+    // n_tokens == 1 only: every query has its OWN set, so a batch would need a different K per
+    // query, which shared-K attention cannot express. Prefill needs a sparse kernel instead.
+    ggml_tensor * k_all   = nullptr;
+    ggml_tensor * kq_mask = nullptr;
 
-    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+    const bool gather_sel = n_tokens == 1 && top_k->ne[0] < n_csa &&
+                            getenv("LLAMA_DSV4_SPARSE_GATHER") != nullptr;
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    if (gather_sel) {
+        const int64_t n_sel = top_k->ne[0];
+
+        ggml_tensor * idx = ggml_reshape_1d(ctx0, top_k, n_sel);
+
+        // csa_k is [n_embd_head, 1, n_csa, 1] and contiguous, so the kv axis is a plain row index
+        ggml_tensor * csa_2d = ggml_view_2d(ctx0, csa_k, csa_k->ne[0], n_csa, csa_k->nb[2], 0);
+
+        ggml_tensor * sel = ggml_get_rows(ctx0, csa_2d, idx); // get_rows promotes to f32
+        sel = ggml_cast(ctx0, sel, csa_k->type);
+        sel = ggml_reshape_4d(ctx0, sel, csa_k->ne[0], 1, n_sel, 1);
+        cb(sel, "csa_k_sel", il);
+
+        k_all = ggml_concat(ctx0, raw_k, sel, 2);
+
+        // the same rows of the mask, so causality and validity still apply to what was selected
+        ggml_tensor * m_2d = ggml_view_2d(ctx0, inp_csa.kq_mask, 1, n_csa,
+                ggml_type_size(inp_csa.kq_mask->type), 0);
+
+        ggml_tensor * m_sel = ggml_get_rows(ctx0, m_2d, idx);
+        m_sel = ggml_cast(ctx0, m_sel, inp_csa.kq_mask->type);
+        m_sel = ggml_reshape_2d(ctx0, m_sel, n_sel, 1);
+
+        kq_mask = ggml_concat(ctx0, inp_attn->get_kq_mask(), m_sel, 0);
+    } else {
+        k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+
+        ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+        ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+
+        kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    }
+    cb(k_all,   "csa_k_all", il);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
@@ -1176,6 +1216,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_build_forward_expand(gf, hca_state_score);
     }
 
+
     ggml_tensor * out = nullptr;
     if (inp_mtp) {
         out = build_attn(inp_mtp,
@@ -1218,6 +1259,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     return out;
 }
 
+
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
     ggml_tensor * cur;
@@ -1238,7 +1280,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     // layer 0 instead of stalling at each layer. This op is the identity on the token ids and the
     // hash layers index tid2eid with its output, which is what orders it first.
     ggml_tensor * hash_tokens = res->t_inp_tokens;
+    // At gpu_slot 3 the GPU owns residency, so a CPU-side prefetch would reserve slots the kernel
+    // knows nothing about and the two would disagree about what is where.
     if (mstream != nullptr && hparams.dsv4_hash_layer_count > 0 && res->t_inp_tokens != nullptr &&
+            mstream->gpu_slot < 3 &&
             std::getenv("LLAMA_MOE_STREAM_NO_HASH_PREFETCH") == nullptr) {
         bool any = false;
         for (uint32_t il = 0; il < hparams.dsv4_hash_layer_count; il++) {
@@ -1331,6 +1376,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
+
+
         cb(inpL, "l_last", il);
     }
 

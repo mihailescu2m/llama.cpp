@@ -1098,9 +1098,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_SLOT_RESOLVE",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1215,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_slot_resolve(ids, state, ref)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5392,6 +5396,38 @@ struct ggml_tensor * ggml_argsort_top_k(
 }
 
 // ggml_top_k
+
+struct ggml_tensor * ggml_moe_slot_resolve(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * ref,
+        int                   n_expert,
+        int                   n_slots,
+        int                   layer,
+        int                   mode) {
+    GGML_ASSERT(ids->type   == GGML_TYPE_I32);
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    if (ref) {
+        GGML_ASSERT(ref->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_are_same_shape(ref, ids));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32,
+            ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3]);
+
+    const int32_t params[4] = { n_expert, n_slots, layer, mode };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_SLOT_RESOLVE;
+    result->src[0] = ids;
+    result->src[1] = state;
+    result->src[2] = ref;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_top_k(
         struct ggml_context * ctx,

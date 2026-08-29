@@ -458,6 +458,8 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t n_dense;  // sparse variant only: kv entries every query attends
+    int32_t n_sel;    // sparse variant only: selected kv entries per query
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {
@@ -1171,6 +1173,13 @@ typedef struct {
     int32_t  ne3;
     int32_t  top_k;
 } ggml_metal_kargs_argsort;
+
+typedef struct {
+    int32_t n;         // number of selected (token, expert) pairs
+    int32_t n_expert;  // experts the router chooses from
+    int32_t n_slots;   // expert cache slots in this layer
+    int32_t mode;      // 1 = verify against src[2], 3 = the GPU owns residency
+} ggml_metal_kargs_moe_slot_resolve;
 
 typedef struct {
     int64_t  ne00;

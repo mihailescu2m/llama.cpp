@@ -7073,6 +7073,7 @@ struct test_leaky_relu : public test_case {
 };
 
 // GGML_OP_FLASH_ATTN_EXT
+// DeepSeek sparse attention: every query attends a dense prefix plus its own selected kv entries
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
     const int64_t hsv; // V head size
@@ -9958,6 +9959,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // DeepSeek-V4-Flash CSA/LID attention shapes: head size 512, 64 query heads over 1 KV head,
+    // f16 KV. The pairs below bracket what a per-query sparse attention kernel could win: the
+    // "dense" kv is raw(4352) + the whole pooled history, the "sparse" kv is raw(4352) + the 512
+    // blocks the lightning indexer actually selected. The ratio is the CEILING on any gather.
+    for (int64_t nb : {1, 4096}) {
+        for (int64_t kv : {4864, 8448, 14592, 37120}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                        GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
@@ -10156,6 +10169,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // the sparse counterpart: same dense prefix (raw/SWA 4352) but only 512 selected entries,
+    // against the dense cases below which must scan the whole pooled history
+    for (int64_t nb : {1, 4096}) {
+        for (int64_t kv : {8448, 14592}) {
+        }
+    }
+
+    // DeepSeek-V4-Flash CSA/LID attention: head size 512, 64 query heads over 1 KV head, f16 KV.
+    // The kv values bracket what a per-query sparse attention kernel could win: 4864 is
+    // raw(4352) + the 512 blocks the lightning indexer selects, the larger ones are raw + the whole
+    // pooled history at 16k / 41k / 128k of context. dense/sparse is the CEILING on any gather.
+    for (int64_t nb : {1, 4096}) {
+        for (int64_t kv : {4864, 8448, 14592, 37120}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                        GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
