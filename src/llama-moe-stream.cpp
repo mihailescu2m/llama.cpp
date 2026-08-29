@@ -274,6 +274,89 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
     return cache;
 }
 
+void llama_moe_stream::register_ple(const ggml_tensor * meta, uint16_t file_idx, size_t offs) {
+    GGML_ASSERT(meta != nullptr);
+    GGML_ASSERT(ggml_is_contiguous(meta));
+    GGML_ASSERT(ggml_n_dims(meta) == 2);
+    GGML_ASSERT(meta->ne[0] > 0 && meta->ne[1] > 0);
+    GGML_ASSERT(!ple.registered);
+
+    ple.registered = true;
+    ple.type       = meta->type;
+    ple.file_idx   = file_idx;
+    ple.offs       = offs;
+    ple.row_ne     = meta->ne[0];
+    ple.n_rows     = meta->ne[1];
+    ple.row_size   = ggml_row_size(meta->type, meta->ne[0]);
+
+    GGML_ASSERT(ple.row_size == meta->nb[1]);
+    GGML_ASSERT(ple.row_size * (size_t) ple.n_rows == ggml_nbytes(meta));
+}
+
+void llama_moe_stream::read_ple_rows(const std::vector<int32_t> & rows, ggml_tensor * dst) {
+    GGML_ASSERT(ple.registered && ple_file != nullptr);
+    GGML_ASSERT(dst != nullptr && dst->type == ple.type);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->ne[0] == ple.row_ne);
+    GGML_ASSERT((size_t) ggml_nelements(dst) == (size_t) ple.row_ne * rows.size());
+
+    const size_t nbytes = ple.row_size * rows.size();
+    GGML_ASSERT(ggml_nbytes(dst) == nbytes);
+
+    // Read each unique row once. Sorting by file offset gives the buffered reader and SSD a less
+    // hostile access pattern during large prefills; decode still consists of only a few rows.
+    std::vector<std::pair<int32_t, size_t>> reads;
+    std::vector<size_t> duplicate_of(rows.size(), SIZE_MAX);
+    std::unordered_map<int32_t, size_t> first;
+    first.reserve(rows.size());
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const int32_t row = rows[i];
+        if (row < 0 || (int64_t) row >= ple.n_rows) {
+            throw std::runtime_error(format("PLE row %d is outside [0, %lld)", row, (long long) ple.n_rows));
+        }
+        const auto [it, inserted] = first.emplace(row, i);
+        if (inserted) {
+            reads.emplace_back(row, i);
+        } else {
+            duplicate_of[i] = it->second;
+        }
+    }
+    std::sort(reads.begin(), reads.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        if (load_failed) {
+            throw std::runtime_error("PLE row streaming: a previous model read failed");
+        }
+        GGML_ASSERT(ple_pending == 0 && q_ple.empty());
+
+        ple_buf.resize(nbytes);
+        ple_pending = reads.size();
+        start_workers_locked();
+
+        for (const auto & [row, i] : reads) {
+            q_ple.push_back({ row, ple_buf.data() + i*ple.row_size });
+        }
+        cv_work.notify_all();
+
+        cv_done.wait(lk, [&] { return load_failed || ple_pending == 0; });
+        if (load_failed) {
+            throw std::runtime_error("PLE row streaming: model read failed");
+        }
+    }
+
+    for (size_t i = 0; i < duplicate_of.size(); ++i) {
+        if (duplicate_of[i] != SIZE_MAX) {
+            memcpy(ple_buf.data() + i*ple.row_size,
+                   ple_buf.data() + duplicate_of[i]*ple.row_size,
+                   ple.row_size);
+        }
+    }
+
+    ggml_backend_tensor_set(dst, ple_buf.data(), 0, nbytes);
+}
+
 void llama_moe_stream::alloc_bufs(bool no_alloc) {
     if (ctx_state && ggml_get_first_tensor(ctx_state.get()) != nullptr) {
         ggml_backend_buffer_t buf;
@@ -350,6 +433,15 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
     };
 
     open_all(use_direct_io);
+
+    if (ple.registered) {
+        if (ple.file_idx >= paths.size()) {
+            throw std::runtime_error("PLE row streaming file index is out of range");
+        }
+        ple_file = std::make_unique<llama_file>(paths[ple.file_idx].c_str(), "rb", false);
+        LLAMA_LOG_WARN("%s: PLE row streaming enabled: %.2f GiB table, %zu-byte rows, buffered parallel reads\n",
+                __func__, (double) (ple.row_size * (size_t) ple.n_rows) / (1024.0*1024.0*1024.0), ple.row_size);
+    }
 
     // fall back to buffered when O_DIRECT is unusable: either the open did not honor it (macOS,
     // Windows, unsupported filesystems), or it opened but a probe read fails (some network/overlay
@@ -435,9 +527,28 @@ void llama_moe_stream::worker_loop() {
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_spec.empty(); });
+        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_ple.empty() || !q_spec.empty(); });
         if (shutting_down) {
             break;
+        }
+
+        // demand first, always. PLE rows are also blocking graph inputs, ahead of speculative work.
+        if (q_demand.empty() && !q_ple.empty()) {
+            const llama_moe_stream_ple_work w = q_ple.front();
+            q_ple.pop_front();
+
+            lk.unlock();
+            const uint8_t * data = llama_moe_stream_pread(*ple_file, w.dst, ple.row_size,
+                    ple.offs + (size_t) w.row*ple.row_size, /*direct =*/ false);
+            lk.lock();
+
+            if (data == nullptr) {
+                load_failed = true;
+            }
+            GGML_ASSERT(ple_pending > 0);
+            ple_pending--;
+            cv_done.notify_all();
+            continue;
         }
 
         // demand first, always: a layer is blocked on those, nothing is blocked on a prefetch
