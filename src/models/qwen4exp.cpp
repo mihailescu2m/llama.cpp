@@ -2,9 +2,11 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-stream.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <numeric>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -136,8 +138,16 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("PLE head %u range exceeds the %" PRId64 " table rows", h, ple_rows));
             }
         }
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        // moe-stream reads the rows itself with buffered parallel preads; upstream's lazy path
+        // is mmap-only, so it is the fallback for when streaming is off.
+        if (auto * stream = moe_stream()) {
+            stream->register_ple(ple_w.tensor, ple_w.idx, ple_w.offs);
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_STREAMED);
+        } else {
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        }
     }
 
     for (int il = 0; il < n_layer; ++il) {
@@ -1056,6 +1066,7 @@ public:
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * table = nullptr;  // compact quantized rows when PLE streaming is enabled
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1124,6 +1135,15 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
             }
         }
+    }
+
+    if (table != nullptr) {
+        auto * stream = pmodel.moe_stream();
+        GGML_ASSERT(stream != nullptr && stream->ple.registered);
+        stream->read_ple_rows(idx, table);
+
+        // The compact tensor has the requested rows in request order, so gather row i from slot i.
+        std::iota(idx.begin(), idx.end(), 0);
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
@@ -1219,10 +1239,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;
+
+    // With streaming the full table is never resident: set_input reads just this ubatch's rows
+    // into a compact tensor, and get_rows dequantizes it exactly as it would the full table.
+    ggml_tensor * table = model.per_layer_tok_embd;
+    if (auto * stream = model.moe_stream(); stream && stream->ple.registered) {
+        GGML_ASSERT(stream->ple.row_ne == hparams.ple_head_dim);
+        table = ggml_new_tensor_2d(ctx0, stream->ple.type, stream->ple.row_ne, n_heads * n_tokens);
+        ggml_set_input(table);
+        ple_inp->table = table;
+    }
+    GGML_ASSERT(table != nullptr);
+
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
