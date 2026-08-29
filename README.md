@@ -1,126 +1,198 @@
-# llama.cpp
+# llama.cpp — very large MoE models on a 64 GB Mac
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for running MoE models **far larger
+than available RAM** by streaming their routed experts from SSD on demand, tuned specifically for
+Apple Silicon.
 
-<div align="center">
+Target hardware: **M1 Max, 64 GB, ~400 GB/s**. Everything except the routed experts stays resident;
+the experts live in a bounded cache filled by demand loads and a one-layer-ahead prefetcher. The
+usable checkpoint size is therefore set by **disk throughput, not by RAM** — a 284B model in 107 GiB
+runs on a machine with 64 GB, at a speed that is genuinely usable for agentic coding.
 
-<b>LLM inference in C/C++</b>
+Decode at depth is dominated by the KV read, not by weight traffic, which is why streaming the
+experts costs so little once the context is deep. That is the entire premise of this approach, and
+most of the optimisation effort targets prefill and long context rather than short-prompt decode.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+---
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+## Support the Project
 
-</div>
+If this work is useful to you, a small donation is greatly appreciated and helps fund continued
+development.
 
-## Quick start
+[![Donate with PayPal](https://www.paypalobjects.com/en_AU/i/btn/btn_donate_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=mihailescu2m%40gmail%2Ecom&lc=AU&item_name=memeka&item_number=odroid&currency_code=AUD&bn=PP%2DDonationsBF%3Abtn_donate_LG%2Egif%3ANonHosted)
 
-A few options to get `llama.cpp` installed on your machine:
+---
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+## Benchmarks
 
-Once installed:
+`tools/llama-bench` is updated to support MoE streaming (`--moe-stream`, `--moe-stream-cache`,
+`--moe-stream-io-threads`), so every figure below is reproducible with the stock harness.
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+### Qwen3.8-Flash-Next — `UD-iQ4_K_XXS` (82.90 GiB), cache 32 GiB
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+llama-bench, no speculation, `-r 2` (`-r 1` at 128k):
+
+| context | pp t/s | tg t/s |
+|---:|---:|---:|
+| 4096 | 160.64 | 10.91 |
+| 8192 | 159.11 | 10.82 |
+| 16384 | 156.00 | 10.67 |
+| 32768 | 150.81 | 10.02 |
+| 65536 | 144.37 | 9.19 |
+| 131072 | 132.79 | 8.03 |
+
+With the native MTP head, decode rises to **17.6 t/s at 4k and 13.0 t/s at 128k** — a gain of
+**+51% to +91%** depending on context, for 5.7–9.2% of prefill. Full A/B in the model log.
+
+### DeepSeek-V4-Flash-0731 — `UD-iQ4-XXS` (107.34 GiB), cache 40 GiB
+
+| context | pp t/s | tg t/s |
+|---:|---:|---:|
+| 4096 | 56.28 | 6.86 |
+| 8192 | 55.11 | 6.66 |
+| 16384 | 53.02 | 6.52 |
+| 32768 | 50.69 | 6.68 |
+| 65536 | 47.62 | `<?>` |
+| 131072 | `<?>` | `<?>` |
+
+The DeepSeek sweep was stopped before the two longest contexts. Its prefill is also well below what
+this checkpoint's predecessor recorded (`UD-IQ3_XXS` at cache 44 measured pp32768 = 100.3), and that
+gap is **unexplained** — different checkpoint, different cache size and a possible regression are all
+still on the table. Treat the DeepSeek column as provisional until that is resolved.
+
+Usage:
+
+```bash
+llama-bench -m <model> -ngl 99 --moe-stream --moe-stream-cache 32 \
+  --moe-stream-io-threads 8 -b 4096 -ub 4096 -fa 1 -r 2 \
+  -p 4096,8192,16384,32768,65536,131072 -n 0
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Decode figures are *post-prefill* — the regime agentic use actually sees, since every turn
+re-prefills. Warm decode runs 2–16% higher. Every cell above was checked for paging by sampling
+`vm.swapusage` around it; a configuration that swaps produces numbers that look fine and mean
+nothing.
 
-## Description
+---
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+## Building
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+Standard llama.cpp build; Metal is the only backend this fork is tuned for.
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+```bash
+cmake -B build -DGGML_METAL=ON
+cmake --build build -j8 --config Release
+```
 
-## Supported backends
+Verify the ggml operations, including the ones this fork adds:
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+```bash
+./build/bin/test-backend-ops -o UNION_BUILD -o FLASH_ATTN_UNION
+```
 
-## Documentation
+---
 
-#### Tools
+## Running
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+```bash
+llama-server -m <first shard> \
+  -ngl 99 --moe-stream --moe-stream-cache 40 --moe-stream-io-threads 8 \
+  -c 131072 -b 4096 -ub 4096 -np 1 -fa on
+```
 
-#### Development
+Two parameters carry most of the performance:
+* **`-ub 4096`** - dominates prefill, and
+* **`--moe-stream-cache`** - should be sized to your machine's free RAM, *not* to the model — leave
+~4 GB of headroom or allocation fails, more if using MTP.
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+Streaming, union-8 attention and the lookahead prefetcher are on by default, each with a kill switch.
 
-## Contributing
+---
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+## What this fork adds on top of upstream
 
-## Acknowledgements
+Organised by the commit layers in this branch. The measured effect of each is in the model logs.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+* **MoE expert streaming**
+The core of the fork. Routed experts stream from SSD into a bounded cache: parallel slab reads,
+one-layer-ahead prefetch, route-hotness eviction with decay, GPU-side slot resolution (no CPU
+round-trip, no graph split), zero-copy loads straight into the Metal shared buffer, and per-row
+streaming for gather tables too large to map.
+
+* **Metal optimisations**
+Per-kernel GPU attribution behind `GGML_METAL_KPROF`, per-context GPU busy time with op-named debug
+groups, an occupancy probe, and a routing-capture tool. A flash-attention unroll cap at DK=512
+(worth **+60–90% prefill**) and a byte-indexed half2 table for the MXFP4 GEMV. KPROF is the reason
+most of the rest of this list exists — it is what turned "decode feels slow" into a ranked list.
+
+* **Union-8 sparse attention**
+Eight queries share one deduplicated top-k list instead of eight independent gathers — **1.94x over
+dense at kv=16384**, and the reason decode stays flat as context grows.
+
+* **Speculation & serving**
+Model-free n-gram speculation (DeepSeek), a native MTP head (Qwen) with `--spec-max-prompt` to stop a draft head from costing more prefill than it saves, correct draft-context sizing for MoE drafters, and slot
+checkpoint persistence so a restored session does not re-prefill from scratch.
+
+* **Model support & fixes**
+Recurrent-state rollback, indexer-cache correctness across sequence copies, graph-shape fixes that
+restore broken kernel fusions, and block-level indexer top-k that flattens the prefill quadratic by
+**5.8x**.
+
+---
+
+## The two models, and why they are hard
+
+They are hard in completely different ways, which is why each has its own log.
+
+### DeepSeek-V4-Flash-0731 — the I/O problem
+
+284B, 256 experts per layer. The model is 107 GiB (`UD-iQ4-XXS`) and the machine has 64 GB, so the experts must
+come off the disk *while the GPU waits*. Everything is about hiding that latency: prefetch far
+enough ahead, keep the right experts resident, and never let a demand read queue behind speculative
+work. The instructive part is how much of the obvious tuning turned out to be wrong — the page
+cache serves 3% of reads, removing 97% of graph splits changed nothing, and stall is per *layer*,
+not per miss.
+
+→ **[Full research log](docs/DeepSeek-V4-Flash-0731.md)** — features, negative results, retractions, sweeps.
+
+### Qwen3.8-Flash-Next — the graph-shape problem
+
+Runs on `UD-iQ4_K_XXS`, a custom splice built here: unsloth's `UD-Q3_K_XL` with 43 of its 48
+down-projections swapped to **MXFP4** — the one expert format this fork has a hand-optimised Metal
+GEMV for — while keeping the smaller `IQ4_NL` PLE table. 0.9 GiB smaller than the base it came from.
+
+Fast enough that the bottleneck left the disk entirely. What remained was GPU work the graph did not
+need to do: a reshape that silently broke Metal's `RMS_NORM→MUL` fusion, copies that bought nothing,
+a full sort of 512 expert scores to read the top 10, and an indexer materialising a table
+proportional to context x chunk size on every layer. Plus three genuinely awkward architectural
+features: four parallel residual streams, a 26.8 GiB n-gram table that cannot be resident, and a
+native MTP head whose hidden-state contract has three separate ways to fail silently.
+
+→ **[Full research log](docs/Qwen3.8-Flash-Next.md)** — features, negative results, retractions, sweeps.
+
+---
+
+## On the research logs
+
+Both logs record **negative results and retractions as first-class content**, not as an appendix.
+Roughly half the entries are ideas that look obviously correct on paper and cost real GPU time to
+disprove; several more are claims this project made, believed, acted on, and later had to withdraw.
+
+That is deliberate. On hardware this constrained, knowing which plausible optimisation *does not*
+work — and why — has been worth more than the wins. Each retraction records the reasoning error, not
+just the corrected number, because the error is the reusable part.
+
+Every figure carries its conditions. Cold and warm decode differ by ~25% here, a prefill sweep
+evicts the decode working set, and a percentage quoted off a curve without its context length means
+nothing — so figures without conditions attached are not quotable, including our own earlier ones.
+
+---
+
+## Upstream
+
+This fork tracks [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Upstream documentation
+applies for everything not listed above; see [the upstream README](https://github.com/ggml-org/llama.cpp#readme)
+for supported backends, model conversion and the general tool set.
+
+Bugs found here that belong upstream are noted as such in the model logs.
