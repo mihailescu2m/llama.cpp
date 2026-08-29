@@ -572,9 +572,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
     ggml_tensor * pooled = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
+        // no cont: ADD needs contiguous rows, which this dim-1 strided view already has
+        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                members->nb[2], members->nb[3], i*members->nb[1]);
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
@@ -599,13 +599,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+    ggml_tensor * q_flat = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream);
+
+    // Put q on the LEFT so the head index lands in dim 0 and sum_rows sums the heads directly.
+    // The pooled-left orientation needs a permute+cont over [n_blocks, n_idx_h, n_tps] before the
+    // sum (~640 MB per layer per 4096-token chunk at 32k); this one only transposes the SUMMED
+    // score, which is n_idx_h times smaller. Decode keeps the original orientation: with
+    // n_tps <= 8 the permutes are tiny, and the swap would put the score matmul on the tiled-MM
+    // path with nh rows - the skinny-m pathology.
+    // LLAMA_QWEN4EXP_QSCORE=0 restores the pooled-left orientation everywhere.
+    static const bool qscore_left = [] {
+        const char * e = getenv("LLAMA_QWEN4EXP_QSCORE");
+        return !e || atoi(e) != 0;
+    }();
+
+    ggml_tensor * score;
+    if (qscore_left && n_tps > 8) {
+        score = ggml_mul_mat(ctx0, q_flat, pooled);                 // [n_idx_h*n_tps, n_blocks, ns]
+        score = ggml_relu(ctx0, score);
+        score = ggml_reshape_2d(ctx0, score, n_idx_h, n_tps*n_blocks*n_stream);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_reshape_3d(ctx0, score, n_tps, n_blocks, n_stream);
+        // top-k selects over ne[0] and the bias is [n_blocks, n_tps, ns], so put blocks back in
+        // dim 0. This transpose is the only full-size copy that survives.
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+    } else {
+        score = ggml_mul_mat(ctx0, pooled, q_flat);
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+        score = ggml_relu(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+    }
     cb(score, "indexer_score", il);
 
     // one value per block, so it is cheaper to bias here than after the cells are expanded
