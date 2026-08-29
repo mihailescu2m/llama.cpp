@@ -1100,6 +1100,10 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        // qwen4exp shares the delta-net base + build_rs path with qwen35, and its extra
+        // caches already mirror rollback: the indexer cache is addressed by the attention
+        // cells, and the conv state now writes every ring bank (see build_conv_state_at).
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
