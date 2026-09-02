@@ -2136,10 +2136,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // whole token set and masks the rest away), and prefill is now measured as ~94% GPU, so
             // whether those masked passes are FLOP-expensive or bandwidth-cheap is the open question.
             // Safe at any value because stage_wave_locked bounds its keep-set by the real slack.
+            //
+            // The override is a MEASUREMENT tool, so it has to win outright: the partition budget
+            // below used to recompute stream_wave_cap unconditionally, which silently ran a sweep
+            // at a cap other than the one asked for - and only for the smaller ubatches, so it
+            // corrupted part of a sweep rather than all of it. cap_forced keeps it honest.
+            bool cap_forced = false;
             if (const char * s = getenv("LLAMA_MOE_STREAM_WAVE_CAP")) {
                 const uint32_t want = (uint32_t) std::max(1, atoi(s));
                 stream_wave_cap = std::clamp(want, (uint32_t) n_expert_used,
                                              msl->n_slots - (uint32_t) n_expert_used);
+                cap_forced = true;
             }
             if (stream_wave_cap < (uint32_t) n_expert_used) {
                 // a wave must fit at least n_expert_used experts, i.e. n_slots >= 3*n_expert_used
@@ -2168,7 +2175,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 const uint64_t n_pairs   = (uint64_t) n_tokens*n_expert_used;
                 const uint32_t max_waves = (uint32_t) std::max<uint64_t>(1, n_pairs/pairs_per_wave_min);
 
-                if (n_stream_waves > max_waves) {
+                if (cap_forced && n_stream_waves > max_waves) {
+                    // the sweep asked for this cap explicitly; say so rather than quietly retuning
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_WAVE_CAP=%u forces %u waves, "
+                                       "below the %u pairs/wave floor - the static chunk bound may "
+                                       "abort; unset it to let the planner pick\n",
+                                __func__, stream_wave_cap, n_stream_waves, (unsigned) pairs_per_wave_min);
+                    }
+                }
+
+                if (!cap_forced && n_stream_waves > max_waves) {
                     // widen the waves to fit the budget, but never past the residency invariant above
                     const uint32_t cap_max = msl->n_slots > (uint32_t) n_expert_used
                         ? (msl->n_slots - (uint32_t) n_expert_used)/2 : 0;
@@ -2189,6 +2208,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // whole point of partitioning is to stop recomputing a large expert GEMM per wave, and
                 // at these sizes that GEMM is trivial anyway.
                 use_partition = (uint64_t) n_tokens*n_expert_used >= (uint64_t) n_stream_waves*pairs_per_wave_min;
+
+                // Leave one spare expert slot per wave, so the planner's split pass always has a
+                // receiver. A split moves a hot expert's surplus pairs into another wave, which
+                // needs pair room AND a free expert slot there. Pair room always exists (total
+                // capacity n_waves*chunk >= n_pairs), but slot room does not: at cap 52 with 256
+                // experts the wave count ceil(256/52) = 5 leaves 5*52 - 256 = 4 spare slots for the
+                // whole layer, and exhausting them aborts the server mid-request.
+                //
+                // Sizing the count from cap-1 instead takes that to ceil(256/51) = 6 waves and 56
+                // spare slots. It is near-free: the chunk tracks the mean, so n_waves*chunk stays
+                // ~1.5*n_pairs whatever the wave count, as long as the n_tokens floor does not bind.
+                // Guarded by the same pairs-per-wave precondition, which the extra wave must still
+                // satisfy - and where it cannot, n_pairs is small, so n_uniq is small and the slots
+                // were never tight to begin with.
+                // LLAMA_MOE_WAVE_SLACK=0 disables the cap-1 sizing, for A/B against its cost
+                static const bool wave_slack = [] {
+                    const char * e = getenv("LLAMA_MOE_WAVE_SLACK");
+                    return !e || atoi(e) != 0;
+                }();
+
+                if (wave_slack && use_partition && !cap_forced && stream_wave_cap > 1) {
+                    const uint32_t waves_slack =
+                        (uint32_t) ((n_touch_max + stream_wave_cap - 2)/(stream_wave_cap - 1));
+
+                    if (waves_slack > n_stream_waves &&
+                        n_pairs >= (uint64_t) waves_slack*pairs_per_wave_min) {
+                        n_stream_waves = waves_slack;
+                    }
+                }
             }
 
             // Wave count multiplies the expert-GEMM work (each wave re-runs build_expert_gemms over

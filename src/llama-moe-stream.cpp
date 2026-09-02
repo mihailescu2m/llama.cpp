@@ -1568,14 +1568,20 @@ void llama_moe_stream::plan_pairs_locked(llama_moe_stream_layer & sl, const int3
             for (const auto & kv : cnt) if (kv.second > hot_n) { hot = kv.first; hot_n = kv.second; }
             if (hot < 0) break;
 
-            // a receiving wave needs pair room AND an expert slot, and must not already stage `hot`
-            int32_t dst = -1; size_t room = 0;
+            // A receiving wave always needs pair room. It needs a free expert slot only if it does
+            // not already stage `hot` - if it does, the pairs land on a slot that wave has already
+            // reserved, so the move is free. Preferring those receivers is what the earlier version
+            // had backwards: it SKIPPED them, spending a slot where none was needed.
+            int32_t dst = -1; size_t room = 0; bool dst_has = false;
             for (uint32_t v = 0; v < n_waves; v++) {
                 if (v == w || sl.plan_pair[v].size() >= chunk) continue;
-                if (group[v].size() >= sl.plan_capacity) continue;
-                if (std::find(group[v].begin(), group[v].end(), hot) != group[v].end()) continue;
+
+                const bool has = std::find(group[v].begin(), group[v].end(), hot) != group[v].end();
+                if (!has && group[v].size() >= sl.plan_capacity) continue;
+
+                // a free move beats a bigger one that costs a slot
                 const size_t r = chunk - sl.plan_pair[v].size();
-                if (r > room) { room = r; dst = (int32_t) v; }
+                if (has != dst_has ? has : r > room) { room = r; dst = (int32_t) v; dst_has = has; }
             }
             if (dst < 0) {
                 break; // no receiver; the check below reports it rather than truncating silently
@@ -1589,7 +1595,9 @@ void llama_moe_stream::plan_pairs_locked(llama_moe_stream_layer & sl, const int3
                 else                                  { keep.push_back(idx); }
             }
             sl.plan_pair[w].swap(keep);
-            group[dst].push_back(hot);   // stage it in the receiver too
+            if (!dst_has) {
+                group[dst].push_back(hot);   // stage it in the receiver too
+            }
             stats.n_pair_splits++;
             if (moved == 0) break;
         }
@@ -1608,9 +1616,20 @@ void llama_moe_stream::plan_pairs_locked(llama_moe_stream_layer & sl, const int3
     // still loud if a wave cannot be represented - but this should now be unreachable
     for (uint32_t w = 0; w < n_waves; w++) {
         if (sl.plan_pair[w].size() > sl.plan_pair_chunk) {
-            GGML_ABORT("MoE expert streaming: wave %u holds %zu pairs but chunk is %u after splitting; "
-                       "this should be unreachable - report it with the prompt that caused it",
-                    w, sl.plan_pair[w].size(), sl.plan_pair_chunk);
+            // Report which constraint bound, because the two have different fixes: no pair room
+            // means the chunk itself is too small (raise LLAMA_MOE_STREAM_PAIR_SLACK), no slot room
+            // means the wave count is too low for the expert count (the cap-1 sizing in
+            // llama-graph.cpp did not apply, e.g. the pairs-per-wave floor blocked it).
+            size_t free_pairs = 0, free_slots = 0;
+            for (uint32_t v = 0; v < n_waves; v++) {
+                free_pairs += sl.plan_pair[v].size()   < chunk            ? 1 : 0;
+                free_slots += group[v].size() < (size_t) sl.plan_capacity ? 1 : 0;
+            }
+            GGML_ABORT("MoE expert streaming: wave %u holds %zu pairs but chunk is %u after splitting "
+                       "(%u waves, %zu with pair room, %zu with a free expert slot, capacity %u, "
+                       "%zu experts staged); report it with the prompt that caused it",
+                    w, sl.plan_pair[w].size(), sl.plan_pair_chunk,
+                    n_waves, free_pairs, free_slots, sl.plan_capacity, sl.uniq.size());
         }
     }
 }
