@@ -571,7 +571,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
     // GGML_METAL_DEBUG_GROUPS names every dispatch after its ggml op so an external Metal profiler
     // can attribute GPU time per op. use_capture already does this, but only for ONE graph and only
     // while starting a real Metal capture, which conflicts with a profiler that is already recording.
-    static const bool debug_groups = getenv("GGML_METAL_DEBUG_GROUPS") != nullptr;
+    static const bool debug_groups = ggml_metal_positive_env("GGML_METAL_DEBUG_GROUPS") > 0;
 
     const bool label = ctx->use_capture || debug_groups;
 

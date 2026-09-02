@@ -157,7 +157,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         }
 
         {
-            res->gpu_profile = getenv("GGML_METAL_GPU_PROFILE") != NULL;
+            res->gpu_profile = ggml_metal_positive_env("GGML_METAL_GPU_PROFILE") > 0;
             res->prof_group = res->gpu_profile ? dispatch_group_create() : NULL;
             atomic_store(&res->prof_gpu_ns, 0);
             atomic_store(&res->prof_cmd_bufs, 0);

@@ -862,7 +862,7 @@ static struct {
 
 static pthread_once_t g_kprof_once = PTHREAD_ONCE_INIT;
 
-static int ggml_metal_positive_env(const char * name) {
+int ggml_metal_positive_env(const char * name) {
     const char * value = getenv(name);
     if (value == NULL) {
         return 0;

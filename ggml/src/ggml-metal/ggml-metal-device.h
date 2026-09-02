@@ -105,6 +105,13 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 // every function here is a no-op and the encode path is byte-for-byte the usual one.
 //
 
+// Value of `name` when it parses as a positive integer, else 0 (unset, empty, malformed, or <= 0).
+//
+// Every opt-in switch here must go through this rather than a `getenv(...) != NULL` presence test:
+// with a presence test, `VAR=0` ENABLES the feature, which silently inverts any A/B that tries to
+// turn it off. That defect cost a real measurement in LLAMA_MOE_STREAM_PARTITION.
+int  ggml_metal_positive_env(const char * name);
+
 // non-zero when GGML_METAL_KPROF is set to a positive stride
 int  ggml_metal_kprof_stride(void);
 
