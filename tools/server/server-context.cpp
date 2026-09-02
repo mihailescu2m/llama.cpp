@@ -2780,7 +2780,8 @@ private:
                             slot->prompt.tokens.size(),
                             slot->prompt.checkpoints);
                     if (!slot->prompt.checkpoints.empty() && nwrite_ckpt == 0) {
-                        SRV_WRN("slot save: checkpoint sidecar write failed; restore will fall back to re-prefill\n");
+                        SRV_WRN("%s\n",
+                                "slot save: checkpoint sidecar write failed; restore will fall back to re-prefill");
                     } else {
                         SRV_INF("slot save: %zu checkpoint(s), %.2f MiB sidecar\n",
                                 slot->prompt.checkpoints.size(), (double) nwrite_ckpt / 1024.0 / 1024.0);
