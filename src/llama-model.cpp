@@ -1877,6 +1877,48 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!ml.no_alloc) {
                 pimpl->moe_stream->open_files(ml.file_paths);
             }
+
+            // LLAMA_MOE_STREAM_LOOKAHEAD=K: at layer L, predict layer L+1's routing from L's router
+            // input and start those loads a layer early. Skipped where the next layer routes by
+            // token id (deepseek4 hash layers) - a logits prediction is meaningless there.
+            // ON by default at n_expert_used. Measured on DSV4-Flash (6 used of 256), 32k prefill
+            // then 160 decode tokens, generation t/s:
+            //
+            //     off   top-4   top-6   top-8   top-16
+            //     6.0    6.8     7.3     6.9     5.0
+            //
+            // The peak sits exactly at the routing width: predicting fewer under-covers the layer,
+            // predicting more spends drive bandwidth on experts that will not be used - and top-16
+            // is WORSE than off despite the lowest miss rate (1.1-3.1%), because ~1000 speculative
+            // loads per 2 s starve the demand loads the GPU is actually blocked on.
+            //
+            // LLAMA_MOE_STREAM_LOOKAHEAD=0 disables; any other value overrides the width.
+            {
+                const char * e = std::getenv("LLAMA_MOE_STREAM_LOOKAHEAD");
+                const uint32_t k = e ? (uint32_t) std::max(0, atoi(e))
+                                     : (uint32_t) hparams.n_expert_used;
+                uint32_t n_la = 0;
+                for (uint32_t il = 0; k > 0 && il + 1 < n_layer_all; il++) {
+                    auto * sl   = pimpl->moe_stream->layer(il);
+                    auto * next = pimpl->moe_stream->layer(il + 1);
+                    if (!sl || !next || il + 1 < hparams.dsv4_hash_layer_count) {
+                        continue;
+                    }
+                    if (!layers[il + 1].ffn_gate_inp) {
+                        continue;
+                    }
+                    sl->la_gate_inp = layers[il + 1].ffn_gate_inp;
+                    sl->la = new llama_moe_stream_lookahead();
+                    sl->la->sl       = sl;
+                    sl->la->sl_next  = next;
+                    sl->la->top_k    = k;
+                    sl->la->bias_src = layers[il + 1].ffn_exp_probs_b;
+                    n_la++;
+                }
+                if (n_la > 0) {
+                    LLAMA_LOG_WARN("%s: MoE lookahead prefetch: top-%u on %u layers\n", __func__, k, n_la);
+                }
+            }
         }
     }
 

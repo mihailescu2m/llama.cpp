@@ -2,9 +2,11 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-moe-stream.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -1231,6 +1233,23 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // The first hash_layer_count layers pick experts by token id, so their loads can start before
+    // layer 0 instead of stalling at each layer. This op is the identity on the token ids and the
+    // hash layers index tid2eid with its output, which is what orders it first.
+    ggml_tensor * hash_tokens = res->t_inp_tokens;
+    if (mstream != nullptr && hparams.dsv4_hash_layer_count > 0 && res->t_inp_tokens != nullptr &&
+            std::getenv("LLAMA_MOE_STREAM_NO_HASH_PREFETCH") == nullptr) {
+        bool any = false;
+        for (uint32_t il = 0; il < hparams.dsv4_hash_layer_count; il++) {
+            mstream->register_hash_router((int32_t) il, model.layers[il].ffn_gate_tid2eid, hparams.n_expert_used);
+            any = true;
+        }
+        if (any && !mstream->hash_routers.empty()) {
+            hash_tokens = ggml_map_custom1(ctx0, res->t_inp_tokens, llama_moe_stream_prefetch_hash, 1, mstream);
+            cb(hash_tokens, "moe_hash_prefetch", -1);
+        }
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
@@ -1276,7 +1295,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
         if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
-            selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
+            selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, hash_tokens);
             exp_probs_b = nullptr;
         }
 
