@@ -3535,7 +3535,25 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // Upstream places two tail checkpoints, at (4 + n_ubatch) and 4 tokens
+                            // from the end, which ties prefix-reuse granularity to n_ubatch: a
+                            // follow-up turn whose prompt diverges near the end must resume from the
+                            // checkpoint one full ubatch back and re-prefill everything after it.
+                            // Measured here on a 3,813-token prefix: -ub 2048 re-prefills 2,049
+                            // tokens on the repeat turn, -ub 512 re-prefills 513.
+                            //
+                            // Lowering n_ubatch fixes that but slows the WHOLE prompt (52.9 -> 35.4
+                            // t/s). An intermediate checkpoint decouples the two: the bulk of the
+                            // prompt still runs in full-size batches and only the last stride is
+                            // fragmented. Opt-in, and off by default: checkpoint_min_step defaults
+                            // to 8192, which is >= n_ubatch, so the offsets stay upstream's pair.
+                            const int cp_fine =
+                                (params_base.checkpoint_min_step > 0 &&
+                                 params_base.checkpoint_min_step < n_ubatch)
+                                    ? params_base.checkpoint_min_step
+                                    : n_ubatch;
+
+                            const int checkpoint_offsets[] = {4 + n_ubatch, 4 + cp_fine, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

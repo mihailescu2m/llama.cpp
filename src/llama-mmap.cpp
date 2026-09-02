@@ -181,7 +181,7 @@ struct llama_file::impl {
     }
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
         // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
             if (init_fd()) {
@@ -194,9 +194,30 @@ struct llama_file::impl {
         init_fp(mode);
     }
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     bool init_fd() {
+#if defined(__APPLE__)
+        // macOS has no O_DIRECT; F_NOCACHE is the equivalent. It keeps these reads out of the
+        // unified buffer cache, which is what matters when the caller already holds the bytes in
+        // a cache of its own - MoE expert streaming copies each slab into a device-side slot, so
+        // a page-cache copy is a second, useless copy competing for the same physical RAM.
+        //
+        // F_NOCACHE imposes no alignment requirement of its own, unlike O_DIRECT. We still report
+        // the block alignment below so has_direct_io() stays true and the existing aligned-read
+        // path runs unchanged; over-reading a few KiB per slab costs far less than the branch.
+        fd = open(fname.c_str(), O_RDONLY);
+        if (fd != -1 && fcntl(fd, F_NOCACHE, 1) == -1) {
+            close(fd);
+            fd = -1;
+        }
+        if (fd != -1) {
+            // Expert slabs are read in routing order, not file order, so the kernel's sequential
+            // readahead would fetch neighbours that are never used. Best effort - ignore failure.
+            (void) fcntl(fd, F_RDAHEAD, 0);
+        }
+#else
         fd = open(fname.c_str(), O_RDONLY | O_DIRECT);
+#endif
 
         if (fd != -1) {
             struct stat file_stats{};
@@ -213,7 +234,7 @@ struct llama_file::impl {
         }
         return false;
     }
-#endif
+#endif // __linux__ || __APPLE__
 
     void init_fp(const char * mode) {
         fp = ggml_fopen(fname.c_str(), mode);
