@@ -16,8 +16,10 @@
 #include <vector>
 
 // LLAMA_MOE_STREAM_PARTITION: give each (token, expert) pair to exactly one wave instead of running
-// every wave over every pair and masking the rest to zero. Read in both llama-moe-stream.cpp and
-// llama-graph.cpp, which must agree: the graph sizes the gathered tensors that the planner fills.
+// every wave over every pair and masking the rest to zero. ON by default; set 0 to disable.
+// It only engages for multi-wave ubatches - a single wave has nothing to mask against, so decode
+// keeps the plain path. Read in both llama-moe-stream.cpp and llama-graph.cpp, which must agree:
+// the graph sizes the gathered tensors that the planner fills.
 bool moe_stream_partition();
 
 // SSD streaming of MoE routed expert weights

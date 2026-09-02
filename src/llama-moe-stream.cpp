@@ -1336,7 +1336,10 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
 }
 
 bool moe_stream_partition() {
-    static const bool v = std::getenv("LLAMA_MOE_STREAM_PARTITION") != nullptr;
+    static const bool v = [] {
+        const char * s = std::getenv("LLAMA_MOE_STREAM_PARTITION");
+        return s == nullptr || atoi(s) != 0; // on by default; an EMPTY value must mean off, not on
+    }();
     return v;
 }
 
