@@ -184,6 +184,19 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
 }
 
+void * ggml_backend_tensor_get_host_ptr(const struct ggml_tensor * tensor) {
+    if (tensor == NULL || tensor->buffer == NULL || tensor->data == NULL) {
+        return NULL;
+    }
+    if (tensor->buffer->iface.get_host_ptr == NULL) {
+        return NULL;
+    }
+    if (tensor->buffer->iface.get_host_ptr(tensor->buffer) == NULL) {
+        return NULL;
+    }
+    return tensor->data;
+}
+
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     buffer->usage = usage;

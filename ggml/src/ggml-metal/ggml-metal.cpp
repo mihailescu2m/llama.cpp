@@ -99,6 +99,7 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
     /* .cpy_tensor    = */ ggml_backend_metal_buffer_shared_cpy_tensor,
     /* .clear         = */ ggml_backend_metal_buffer_shared_clear,
     /* .reset         = */ NULL,
+    /* .get_host_ptr  = */ ggml_backend_metal_buffer_shared_get_base,
 };
 
 // private buffer

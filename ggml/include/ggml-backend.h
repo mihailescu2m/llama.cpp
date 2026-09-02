@@ -62,6 +62,12 @@ extern "C" {
     GGML_API size_t                         ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor);
     GGML_API void                           ggml_backend_buffer_clear         (ggml_backend_buffer_t buffer, uint8_t value);
     GGML_API bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
+    // Optional fast path: CPU-writable address of a tensor's data, letting a producer fill it in
+    // place (eg. read a file straight into it) instead of staging through ggml_backend_tensor_set.
+    // NULL means no such path is offered - always fall back, never treat NULL as an error.
+    // NOT the same as is_host, which says whether the CPU backend may run ops on the buffer: Metal
+    // reports is_host false to keep ops on the GPU, yet its shared buffers are plain host memory.
+    GGML_API void *                         ggml_backend_tensor_get_host_ptr  (const struct ggml_tensor * tensor);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
