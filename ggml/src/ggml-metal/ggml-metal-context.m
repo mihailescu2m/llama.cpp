@@ -10,6 +10,7 @@
 #import <Foundation/Foundation.h>
 
 #import <Metal/Metal.h>
+#include <stdatomic.h>
 
 #undef MIN
 #undef MAX
@@ -45,6 +46,13 @@ struct ggml_metal {
 
     // how many times a given op was fused
     uint64_t fuse_cnt[GGML_OP_COUNT];
+
+    // GGML_METAL_GPU_PROFILE: total GPU busy time of this context's command buffers, from Metal's
+    // own GPUStartTime/GPUEndTime. One llama_context gets one Metal context, so with speculative
+    // decoding the target and the draft model report separately - which is the point.
+    bool     gpu_profile;
+    _Atomic  uint64_t prof_gpu_ns;
+    _Atomic  uint64_t prof_cmd_bufs;
 
     // capture state
     int capture_compute;
@@ -147,6 +155,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         }
 
         {
+            res->gpu_profile = getenv("GGML_METAL_GPU_PROFILE") != NULL;
+            atomic_store(&res->prof_gpu_ns, 0);
+            atomic_store(&res->prof_cmd_bufs, 0);
+        }
+
+        {
             const char * val = getenv("GGML_METAL_FUSION_DEBUG");
             res->debug_fusion = val ? atoi(val) : 0;
         }
@@ -193,8 +207,38 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 }
 
+// GGML_METAL_GPU_PROFILE: accumulate a command buffer's GPU busy time once it completes.
+// GPUEndTime/GPUStartTime are Metal's own GPU-side clock, so this measures execution, not the wall
+// time the CPU spent waiting. Only the graph-compute buffers are instrumented - the tensor get/set
+// buffers are not part of the model's compute.
+static void ggml_metal_prof_track(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+    if (!ctx->gpu_profile) {
+        return;
+    }
+
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        const double dt = [cb GPUEndTime] - [cb GPUStartTime];
+        if (dt > 0.0) {
+            atomic_fetch_add(&ctx->prof_gpu_ns, (uint64_t)(dt*1e9));
+            atomic_fetch_add(&ctx->prof_cmd_bufs, 1);
+        }
+    }];
+}
+
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    if (ctx->gpu_profile) {
+        const uint64_t ns = atomic_load(&ctx->prof_gpu_ns);
+        const uint64_t nb = atomic_load(&ctx->prof_cmd_bufs);
+        // straight to stderr as well as the log: ggml_metal_free runs during teardown, after the
+        // CLI has already dropped its log callback, so the logged copy would be discarded
+        fprintf(stderr, "GPU PROFILE: %8.3f s busy over %6llu command buffers (%.3f ms each)\n",
+                ns/1e9, (unsigned long long) nb, nb ? ns/1e6/nb : 0.0);
+        fflush(stderr);
+        GGML_LOG_WARN("%s: GPU PROFILE: %8.3f s busy over %6llu command buffers (%.3f ms each)\n",
+                __func__, ns/1e9, (unsigned long long) nb, nb ? ns/1e6/nb : 0.0);
+    }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -276,6 +320,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             }
         }
     }
+
+    // GGML_METAL_KPROF: every command buffer of the graph has completed, so the counter sample
+    // buffers recorded during encoding can now be resolved
+    ggml_metal_kprof_flush();
 
     // release any completed extra command buffers
     if (ctx->cmd_bufs_ext.count > 0) {
@@ -456,6 +504,42 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    // GGML_METAL_KPROF: KPROF records carry only raw node indices, so dump each distinct graph's
+    // static shape once (keyed by uid). That is what turns timings into a per-kernel attribution.
+    // The KPROFS marker ties each later flush to the graph that produced it - stderr writes from
+    // here and from synchronize() are both on the calling thread, so log order is exact.
+    if (ggml_metal_kprof_stride() > 0) {
+        // dedup by graph SHAPE, not uid: every graph compute mints a fresh uid, so a uid-keyed
+        // table burns its slots on repeats of the same few shapes and leaves the later (larger)
+        // graphs unmapped - KPROF records then cannot be attributed to an op at all.
+        static int kprof_dumped_shapes[256] = { 0 };
+        static int kprof_n_dumped = 0;
+
+        fprintf(stderr, "KPROFS {\"uid\":%llu,\"n_nodes\":%d,\"n_cb\":%d}\n",
+                (unsigned long long) gf->uid, gf->n_nodes, ctx->n_cb);
+
+        bool dumped = false;
+        for (int i = 0; i < kprof_n_dumped; ++i) {
+            if (kprof_dumped_shapes[i] == gf->n_nodes) {
+                dumped = true;
+                break;
+            }
+        }
+
+        if (!dumped && kprof_n_dumped < 256) {
+            kprof_dumped_shapes[kprof_n_dumped++] = gf->n_nodes;
+
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                const struct ggml_tensor * n = gf->nodes[i];
+                fprintf(stderr, "KPROFN {\"uid\":%llu,\"node\":%d,\"op\":\"%s\",\"name\":\"%s\","
+                        "\"ne\":[%lld,%lld,%lld,%lld]}\n",
+                        (unsigned long long) gf->uid, i, ggml_op_desc(n), n->name,
+                        (long long) n->ne[0], (long long) n->ne[1],
+                        (long long) n->ne[2], (long long) n->ne[3]);
+            }
+        }
+    }
+
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -531,6 +615,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
+            ggml_metal_prof_track(ctx, cmd_buf);
 
             if (ctx->cmd_bufs[n_cb].obj) {
                 [ctx->cmd_bufs[n_cb].obj release];
@@ -550,6 +635,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
+            ggml_metal_prof_track(ctx, cmd_buf);
 
             if (ctx->cmd_bufs[cb_idx].obj) {
                 [ctx->cmd_bufs[cb_idx].obj release];

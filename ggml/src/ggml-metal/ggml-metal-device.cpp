@@ -1,5 +1,18 @@
 #include "ggml-metal-device.h"
 
+#include <cstdlib>
+
+// occupancy probe: pad the iq3_xxs threadgroup allocation without the kernel using the extra
+// bytes. Changes residency per core only - arithmetic is untouched, so output is unchanged.
+static int ggml_metal_smem_pad_probe() {
+    static int pad = -1;
+    if (pad < 0) {
+        const char * e = getenv("GGML_METAL_SMEM_PAD");
+        pad = e ? atoi(e) : 0;
+    }
+    return pad;
+}
+
 #include "ggml-metal-impl.h"
 #include "ggml-metal-tuning.h"
 
@@ -941,7 +954,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_IQ3_XXS;
                 nr0 = N_R0_IQ3_XXS;
-                smem = 256*4+128;
+                smem = 256*4+128 + ggml_metal_smem_pad_probe();
             } break;
         case GGML_TYPE_IQ3_S:
             {
@@ -1176,7 +1189,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_IQ3_XXS;
                 nr0 = N_R0_IQ3_XXS;
-                smem = 256*4+128;
+                smem = 256*4+128 + ggml_metal_smem_pad_probe();
             } break;
         case GGML_TYPE_IQ3_S:
             {

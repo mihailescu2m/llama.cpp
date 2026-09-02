@@ -10,6 +10,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <pthread.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -809,17 +810,321 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 }
 
 //
+// GGML_METAL_KPROF - per-segment GPU timestamps via stage-boundary counter sampling
+//
+// Apple GPUs expose only MTLCounterSamplingPointAtStageBoundary (confirmed on M1 Max), so a
+// dispatch cannot be timed directly. Each profiled segment therefore becomes its own compute pass
+// whose start/end boundaries sample the timestamp counter. Inactive unless GGML_METAL_KPROF is set.
+//
+
+#define GGML_METAL_KPROF_SEG_PER_SB   2048
+#define GGML_METAL_KPROF_MAX_SB       32
+#define GGML_METAL_KPROF_MAX_SEGMENTS (GGML_METAL_KPROF_SEG_PER_SB*GGML_METAL_KPROF_MAX_SB)
+
+// counter sample buffers are recycled rather than reallocated: a graph is encoded over (n_cb + 1)
+// command buffers every single decode step, and allocating fresh ones each time leaks address space.
+#define GGML_METAL_KPROF_MAX_FREE_SB  64
+
+struct ggml_metal_kprof_batch {
+    id<MTLCounterSampleBuffer> sb[GGML_METAL_KPROF_MAX_SB];
+    int    n_sb;
+    int  * nodes;   // raw graph node index that starts each segment
+    int    n_seg;
+    int    cap;
+    struct ggml_metal_kprof_batch * next;
+};
+
+static struct {
+    pthread_mutex_t mtx;
+    struct ggml_metal_kprof_batch * pending;
+    id<MTLCounterSampleBuffer> free_sb[GGML_METAL_KPROF_MAX_FREE_SB];
+    int  n_free_sb;
+    int  n_created_sb;
+    int  n_reused_sb;
+    int  n_failed_sb;
+    int  seq;
+    int  stride;
+    bool initialized;
+} g_kprof = {
+    /*.mtx          =*/ PTHREAD_MUTEX_INITIALIZER,
+    /*.pending      =*/ NULL,
+    /*.free_sb      =*/ { nil },
+    /*.n_free_sb    =*/ 0,
+    /*.n_created_sb =*/ 0,
+    /*.n_reused_sb  =*/ 0,
+    /*.n_failed_sb  =*/ 0,
+    /*.seq          =*/ 0,
+    /*.stride       =*/ 0,
+    /*.initialized  =*/ false,
+};
+
+int ggml_metal_kprof_stride(void) {
+    if (!g_kprof.initialized) {
+        pthread_mutex_lock(&g_kprof.mtx);
+        if (!g_kprof.initialized) {
+            const char * v = getenv("GGML_METAL_KPROF");
+            g_kprof.stride = v ? atoi(v) : 0;
+            if (g_kprof.stride < 0) {
+                g_kprof.stride = 0;
+            }
+            g_kprof.initialized = true;
+        }
+        pthread_mutex_unlock(&g_kprof.mtx);
+    }
+    return g_kprof.stride;
+}
+
+static bool ggml_metal_kprof_debug(void) {
+    static bool init = false;
+    static bool on   = false;
+    if (!init) {
+        const char * v = getenv("GGML_METAL_KPROF_DEBUG");
+        on   = v && atoi(v) > 0;
+        init = true;
+    }
+    return on;
+}
+
+static id<MTLCounterSampleBuffer> ggml_metal_kprof_new_sb(id<MTLDevice> dev) {
+    id<MTLCounterSampleBuffer> sb = nil;
+
+    @autoreleasepool {
+        MTLCounterSampleBufferDescriptor * d = [[MTLCounterSampleBufferDescriptor alloc] init];
+
+        for (id<MTLCounterSet> cs in [dev counterSets]) {
+            if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) {
+                d.counterSet = cs;
+                break;
+            }
+        }
+
+        d.sampleCount = 2*GGML_METAL_KPROF_SEG_PER_SB;
+        d.storageMode = MTLStorageModeShared;
+        d.label       = @"ggml-kprof";
+
+        NSError * err = nil;
+        sb = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+        if (sb == nil) {
+            fprintf(stderr, "%s: kprof: newCounterSampleBuffer failed (%s)\n", __func__,
+                    err ? [[err localizedDescription] UTF8String] : "unknown");
+        }
+
+        [d release];
+    }
+
+    return sb;
+}
+
+// caller must NOT hold g_kprof.mtx
+static id<MTLCounterSampleBuffer> ggml_metal_kprof_acquire_sb(id<MTLDevice> dev) {
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (g_kprof.n_free_sb > 0) {
+        id<MTLCounterSampleBuffer> sb = g_kprof.free_sb[--g_kprof.n_free_sb];
+        g_kprof.free_sb[g_kprof.n_free_sb] = nil;
+        g_kprof.n_reused_sb++;
+        pthread_mutex_unlock(&g_kprof.mtx);
+        return sb;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_new_sb(dev);
+
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (sb) {
+        g_kprof.n_created_sb++;
+    } else {
+        g_kprof.n_failed_sb++;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    return sb;
+}
+
+// caller must NOT hold g_kprof.mtx
+static void ggml_metal_kprof_recycle_sb(id<MTLCounterSampleBuffer> sb) {
+    if (sb == nil) {
+        return;
+    }
+    pthread_mutex_lock(&g_kprof.mtx);
+    if (g_kprof.n_free_sb < GGML_METAL_KPROF_MAX_FREE_SB) {
+        g_kprof.free_sb[g_kprof.n_free_sb++] = sb;
+        pthread_mutex_unlock(&g_kprof.mtx);
+        return;
+    }
+    pthread_mutex_unlock(&g_kprof.mtx);
+    [sb release];
+}
+
+//
 // MTLComputeCommandEncoder wrapper
 //
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+
+    // GGML_METAL_KPROF only; nil/NULL and unused when the profiler is off
+    id<MTLCommandBuffer> cmd_buf;
+    bool concurrent;
+    struct ggml_metal_kprof_batch * kprof;
 };
+
+// open a counter-sampled compute pass for the segment starting at `raw_node_idx`
+static void ggml_metal_encoder_kprof_begin(ggml_metal_encoder_t encoder, int raw_node_idx) {
+    struct ggml_metal_kprof_batch * b = encoder->kprof;
+
+    const int isb   = b->n_seg / GGML_METAL_KPROF_SEG_PER_SB;
+    const int islot = b->n_seg % GGML_METAL_KPROF_SEG_PER_SB;
+
+    if (b->n_seg < b->cap && islot == 0 && isb == b->n_sb) {
+        id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_acquire_sb([encoder->cmd_buf device]);
+        if (sb) {
+            b->sb[b->n_sb++] = sb;
+        }
+    }
+
+    @autoreleasepool {
+        if (b->n_seg >= b->cap || isb >= b->n_sb) {
+            // out of slots: fall back to a plain pass so encoding still completes correctly
+            if (encoder->concurrent) {
+                encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+            } else {
+                encoder->obj = [encoder->cmd_buf computeCommandEncoder];
+            }
+            [encoder->obj retain];
+            return;
+        }
+
+        MTLComputePassDescriptor * desc = [MTLComputePassDescriptor computePassDescriptor];
+
+        desc.dispatchType = encoder->concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+
+        desc.sampleBufferAttachments[0].sampleBuffer              = b->sb[isb];
+        desc.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2*islot + 0;
+        desc.sampleBufferAttachments[0].endOfEncoderSampleIndex   = 2*islot + 1;
+
+        b->nodes[b->n_seg] = raw_node_idx;
+        b->n_seg++;
+
+        encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDescriptor:desc];
+        [encoder->obj retain];
+    }
+}
+
+int ggml_metal_encoder_kprof_split(ggml_metal_encoder_t encoder, int raw_node_idx) {
+    if (encoder->kprof == NULL) {
+        return -1;
+    }
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    const int seg = encoder->kprof->n_seg;
+
+    ggml_metal_encoder_kprof_begin(encoder, raw_node_idx);
+
+    return seg;
+}
+
+void ggml_metal_kprof_flush(void) {
+    if (ggml_metal_kprof_stride() == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_kprof.mtx);
+    struct ggml_metal_kprof_batch * head = g_kprof.pending;
+    g_kprof.pending = NULL;
+    const int seq = g_kprof.seq++;
+    pthread_mutex_unlock(&g_kprof.mtx);
+
+    int ibatch = 0;
+
+    while (head != NULL) {
+        struct ggml_metal_kprof_batch * b = head;
+        head = b->next;
+        const int batch = ibatch++;
+
+        for (int isb = 0; isb < b->n_sb; ++isb) {
+            const int seg0  = isb*GGML_METAL_KPROF_SEG_PER_SB;
+            const int left  = b->n_seg - seg0;
+            const int nseg  = left < GGML_METAL_KPROF_SEG_PER_SB ? left : GGML_METAL_KPROF_SEG_PER_SB;
+
+            if (nseg <= 0) {
+                ggml_metal_kprof_recycle_sb(b->sb[isb]);
+                b->sb[isb] = nil;
+                continue;
+            }
+
+            @autoreleasepool {
+                NSData * data = [b->sb[isb] resolveCounterRange:NSMakeRange(0, 2*nseg)];
+
+                if (data && [data length] >= 2*(NSUInteger) nseg*sizeof(MTLCounterResultTimestamp)) {
+                    const MTLCounterResultTimestamp * ts = (const MTLCounterResultTimestamp *) [data bytes];
+
+                    for (int i = 0; i < nseg; ++i) {
+                        const uint64_t t0 = ts[2*i + 0].timestamp;
+                        const uint64_t t1 = ts[2*i + 1].timestamp;
+
+                        const char * error = NULL;
+                        if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue) {
+                            error = "counter timestamp unavailable";
+                        } else if (t1 < t0) {
+                            error = "counter timestamp regressed";
+                        }
+
+                        if (error != NULL) {
+                            fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"seg\":%d,\"node\":%d,"
+                                    "\"error\":\"%s\",\"t0\":%llu,\"t1\":%llu}\n",
+                                    seq, batch, seg0 + i, b->nodes[seg0 + i], error,
+                                    (unsigned long long) t0, (unsigned long long) t1);
+                            continue;
+                        }
+
+                        fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"seg\":%d,\"node\":%d,\"t0\":%llu,\"ns\":%llu}\n",
+                                seq, batch, seg0 + i, b->nodes[seg0 + i],
+                                (unsigned long long) t0, (unsigned long long) (t1 - t0));
+                    }
+                } else {
+                    fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"error\":\"resolve failed\",\"sb\":%d,\"n_seg\":%d}\n",
+                            seq, batch, isb, nseg);
+                }
+            }
+
+            ggml_metal_kprof_recycle_sb(b->sb[isb]);
+            b->sb[isb] = nil;
+        }
+
+        free(b->nodes);
+        free(b);
+    }
+
+    if (ggml_metal_kprof_debug()) {
+        pthread_mutex_lock(&g_kprof.mtx);
+        fprintf(stderr, "KPROFSB {\"seq\":%d,\"batches\":%d,\"created\":%d,\"reused\":%d,\"failed\":%d,\"free\":%d}\n",
+                seq, ibatch, g_kprof.n_created_sb, g_kprof.n_reused_sb, g_kprof.n_failed_sb, g_kprof.n_free_sb);
+        pthread_mutex_unlock(&g_kprof.mtx);
+    }
+}
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    res->cmd_buf    = cmd_buf;
+    res->concurrent = concurrent;
+
+    if (ggml_metal_kprof_stride() > 0) {
+        // one batch per encoder; ownership passes to g_kprof.pending in encoder_free
+        struct ggml_metal_kprof_batch * b = calloc(1, sizeof(struct ggml_metal_kprof_batch));
+        b->cap   = GGML_METAL_KPROF_MAX_SEGMENTS;
+        b->nodes = calloc(b->cap, sizeof(int));
+        res->kprof = b;
+
+        // the first segment starts before any node is encoded; -1 marks that prologue
+        ggml_metal_encoder_kprof_begin(res, -1);
+
+        return res;
+    }
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -834,6 +1139,21 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
     [encoder->obj release];
+
+    struct ggml_metal_kprof_batch * b = encoder->kprof;
+    if (b != NULL) {
+        if (b->n_seg > 0 || b->n_sb > 0) {
+            // queue for ggml_metal_kprof_flush(), which resolves once the command buffers complete
+            pthread_mutex_lock(&g_kprof.mtx);
+            b->next = g_kprof.pending;
+            g_kprof.pending = b;
+            pthread_mutex_unlock(&g_kprof.mtx);
+        } else {
+            free(b->nodes);
+            free(b);
+        }
+    }
+
     free(encoder);
 }
 
