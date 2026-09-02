@@ -273,14 +273,23 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
+        int64_t n_kv,
         bool blk_bias) const {
     GGML_ASSERT(ratio > 0);
+    GGML_ASSERT(n_kv > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
+    GGML_ASSERT(blk_cells != nullptr && blk_pos != nullptr && bias != nullptr);
+    GGML_ASSERT(cell_blk != nullptr || blk_bias);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    if (cell_blk != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(blk_cells->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(blk_pos->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_ns     = blk_cells->ne[1];        // streams in this ubatch
+    GGML_ASSERT(n_ns > 0 && blk_pos->ne[0] % (4*n_ns) == 0);
     const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
@@ -288,7 +297,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    GGML_ASSERT(blk_cells->ne[0] == r*n_blocks);
+    GGML_ASSERT(cell_blk == nullptr || (cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_ns));
+    GGML_ASSERT(bias->ne[0] == (blk_bias ? n_blocks : n_kv));
+    GGML_ASSERT(bias->ne[1] == n_tps && bias->ne[2] == n_ns);
+
+    int32_t * dst_cell_blk  = cell_blk == nullptr ? nullptr : (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
@@ -322,7 +336,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk == nullptr ? nullptr : dst_cell_blk + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
 
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
@@ -504,7 +518,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
             }
 
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            if (cur_cell_blk != nullptr) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            }
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -672,8 +688,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
+        int64_t n_kv,
         bool blk_bias) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, n_kv, blk_bias);
 }

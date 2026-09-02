@@ -77,14 +77,14 @@ public:
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to; optional for block top-k
     //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
     //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv,
                        bool blk_bias) const;
 
 private:
@@ -142,7 +142,7 @@ public:
     uint32_t get_n_stream() const;
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv,
                        bool blk_bias) const;
 
 private:

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -278,8 +279,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    // Keep RMS_NORM -> MUL adjacent so Metal can fuse them. Reshape the scale instead of
+    // putting a reshape between the norm output and its consumer.
+    xn = ggml_mul(ctx0, xn, ggml_reshape_2d(ctx0, w_norm, n_embd, hc));
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -291,14 +294,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
+    // A stream view has contiguous rows, which ADD accepts; its destination is contiguous.
+    // Starting with the view also leaves the following ADD chain eligible for Metal fusion.
+    ggml_tensor * mixed = nullptr;
+    for (int64_t c = 0; c < hc; ++c) {
         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
                 ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
+        mixed = mixed ? ggml_add(ctx0, mixed, s) : s;
     }
     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     cb(mixed, "hc_mixed", il);
@@ -470,15 +473,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 
 // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
+static bool qwen4exp_block_topk() {
+    static const bool enabled = [] {
+        const char * value = getenv("LLAMA_QWEN4EXP_BLOCK_TOPK");
+        if (value == nullptr) {
+            return true;
+        }
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        return end == value || *end != '\0' || parsed != 0;
+    }();
+    return enabled;
+}
+
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, int64_t n_kv, bool blk_bias, bool block_topk) :
+        mctx(mctx), ratio(ratio), n_kv(n_kv), blk_bias(blk_bias), block_topk(block_topk) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, n_kv, blk_bias);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -496,10 +512,14 @@ public:
         bool res = true;
 
         res &= params.ubatch.n_tokens % n_stream == 0;
+        res &= this->n_kv == n_kv;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
-        res &= cell_blk->ne[0]  == n_kv;
-        res &= cell_blk->ne[1]  == n_stream;
+        res &= block_topk == (cell_blk == nullptr);
+        if (cell_blk != nullptr) {
+            res &= cell_blk->ne[0] == n_kv;
+            res &= cell_blk->ne[1] == n_stream;
+        }
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
@@ -517,9 +537,11 @@ public:
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
+    const int64_t n_kv;
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+    const bool block_topk;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -552,6 +574,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const bool blk_bias = kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
+    const bool block_topk = qwen4exp_block_topk() && blk_bias && n_kv % r == 0;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -559,16 +582,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const auto it = qsa_inps.find((uint32_t) r);
     if (it != qsa_inps.end()) {
         inp = it->second;
+        GGML_ASSERT(inp->blk_bias == blk_bias && inp->block_topk == block_topk);
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, n_kv, blk_bias, block_topk);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+        qsa->cell_blk  = block_topk ? nullptr : ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-        ggml_set_input(qsa->cell_blk);
+        if (qsa->cell_blk != nullptr) {
+            ggml_set_input(qsa->cell_blk);
+        }
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
@@ -645,6 +671,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // one value per block, so it is cheaper to bias here than after the cells are expanded
     if (blk_bias) {
         score = ggml_add(ctx0, score, inp->bias);
+    }
+
+    if (inp->block_topk) {
+        // Scores and bias are already block-granular. Selecting here avoids expanding an
+        // [n_blocks, n_tps] surface to [n_kv, n_tps] before top-k.
+        const int64_t width_cells = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+        const int64_t n_blk_sel   = std::min<int64_t>(n_blocks, (width_cells + r - 1)/r);
+
+        ggml_tensor * blk_top = ggml_top_k(ctx0, score, n_blk_sel);
+        cb(blk_top, "indexer_top_blk", il);
+
+        // Expand each selected block id to its r cache-cell ids.
+        ggml_tensor * base = ggml_scale(ctx0, ggml_cast(ctx0, blk_top, GGML_TYPE_F32), (float) r);
+        base = ggml_reshape_4d(ctx0, base, 1, n_blk_sel, n_tps, n_stream);
+
+        ggml_tensor * offset = ggml_arange(ctx0, 0.0f, (float) r, 1.0f);
+        offset = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, offset, r, 1, 1, 1),
+                r, n_blk_sel, n_tps, n_stream);
+
+        ggml_tensor * cells = ggml_cast(ctx0, ggml_add(ctx0, offset, base), GGML_TYPE_I32);
+        cells = ggml_reshape_4d(ctx0, cells, r*n_blk_sel, n_tps, 1, n_stream);
+        cb(cells, "indexer_top_k", il);
+
+        return cells;
     }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
@@ -1136,7 +1186,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    ggml_tensor * x_t = ggml_transpose(ctx0, x);
+    // Metal's generic strided CONCAT is expensive for prefill. A one-token transpose already
+    // has contiguous rows, so avoid adding a decode-only copy.
+    if (!ggml_is_contiguous_rows(x_t)) {
+        x_t = ggml_cont(ctx0, x_t);
+    }
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, x_t, 0);
 
     // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
     // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
