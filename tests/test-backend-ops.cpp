@@ -10663,6 +10663,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Expert-GEMM kernel survey at the two target models' routed-expert shapes, across every quant
+    // type the checkpoints use plus reference formats. n=512 is PP-like (a wave's rows for one
+    // expert), n=1 is TG-like. Ranking these by time per EFFECTIVE bit-per-weight - not by time
+    // alone - is what selects a checkpoint's expert mix: on this GPU the i-quant kernels are
+    // occupancy-bound and lose to simpler formats that read more bytes.
+    for (ggml_type ta : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K,
+                          GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0,
+                          GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_IQ4_XS,
+                          GGML_TYPE_Q3_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS }) {
+        // Qwen3.8-Flash-Next: ffn_gate/up_exps are [2560 -> 640]
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  640, 512, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  640,   1, 2560, {1, 1}, {1, 1}));
+        // DeepSeek-V4-Flash-0731: ffn_gate/up_exps are [4096 -> 2048]
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2048, 512, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2048,   1, 4096, {1, 1}, {1, 1}));
+    }
+
     // Sparse flash attention prefill: long-KV with a sparse mask (n_kv_max hint).
     // the vec FA kernel iterates only n_kv_max valid entries per row instead of the full KV.
     for (int64_t kv : { 2048, 4096, 8192, 16384 }) {
