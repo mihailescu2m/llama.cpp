@@ -54,6 +54,16 @@ GGML_BACKEND_API bool ggml_backend_metal_supports_family(ggml_backend_t backend,
 // capture all command buffers committed the next time `ggml_backend_graph_compute` is called
 GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t backend);
 
+// CPU servicer for MoE expert streaming. When the graph carries GGML_OP_MOE_SLOT_RESOLVE ops that
+// own residency (no reference source), the backend stalls the GPU on a shared event after each one
+// and calls this on Metal's listener queue so the slabs the kernel asked for can be read in. Set it
+// before the first graph runs; passing NULL disables the ownership mode.
+//
+// state_host points at the op's state buffer, which must live in shared storage.
+typedef void (*ggml_backend_metal_moe_servicer_t)(void * user_data, void * state_host, int32_t layer);
+
+GGML_BACKEND_API void ggml_backend_metal_set_moe_servicer(ggml_backend_t backend, ggml_backend_metal_moe_servicer_t fn, void * user_data);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 #ifdef __cplusplus

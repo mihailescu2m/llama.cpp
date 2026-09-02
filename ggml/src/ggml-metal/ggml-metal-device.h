@@ -167,6 +167,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_slot_resolve  (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k             (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -337,6 +338,27 @@ uint64_t ggml_metal_event_value          (ggml_metal_event_t ev);
 
 // invoke cb(user_data, value) on a private queue once the event reaches value
 void ggml_metal_event_notify(ggml_metal_event_t ev, uint64_t value, void (*cb)(void *, uint64_t), void * user_data);
+
+// CPU servicer for GPU-emitted work (MoE expert streaming, LLAMA_MOE_STREAM_GPU_SLOT=3).
+//
+// The resolve kernel decides which expert cache slots must be filled and writes the list into its
+// state buffer. The backend then ends the encoder, encodes a shared-event signal, registers this
+// callback for that value, encodes a wait for value+1 and restarts the encoder. The callback runs
+// on Metal's listener queue and must load the requested slabs before returning; the GPU is stalled
+// for its whole duration, so it stands in for the graph split it replaces (34 us of handshake
+// against ~930 us for a split).
+//
+// state_host points at the layer's state buffer, which must be in shared storage.
+typedef void (*ggml_metal_moe_servicer_t)(void * user_data, void * state_host, int32_t layer);
+
+void ggml_metal_device_set_moe_servicer(ggml_metal_device_t dev, ggml_metal_moe_servicer_t fn, void * user_data);
+bool ggml_metal_device_has_moe_servicer(ggml_metal_device_t dev);
+
+// Reserve the value pair (returns v; the CPU replies with v+1), register the listener, and hand
+// back the event so the caller can encode the signal and the wait. Values are handed out in encode
+// order, which is why mode 3 forces a single command buffer - out-of-order values would let a wait
+// be satisfied by an unrelated signal.
+ggml_metal_event_t ggml_metal_device_moe_handshake(ggml_metal_device_t dev, void * state_host, int32_t layer, uint64_t * value);
 
 ggml_metal_device_t ggml_metal_device_init(int device, int n_devices);
 void ggml_metal_device_free(ggml_metal_device_t dev);

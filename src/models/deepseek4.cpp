@@ -1237,7 +1237,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     // layer 0 instead of stalling at each layer. This op is the identity on the token ids and the
     // hash layers index tid2eid with its output, which is what orders it first.
     ggml_tensor * hash_tokens = res->t_inp_tokens;
+    // At gpu_slot 3 the GPU owns residency, so a CPU-side prefetch would reserve slots the kernel
+    // knows nothing about and the two would disagree about what is where.
     if (mstream != nullptr && hparams.dsv4_hash_layer_count > 0 && res->t_inp_tokens != nullptr &&
+            mstream->gpu_slot < 3 &&
             std::getenv("LLAMA_MOE_STREAM_NO_HASH_PREFETCH") == nullptr) {
         bool any = false;
         for (uint32_t il = 0; il < hparams.dsv4_hash_layer_count; il++) {

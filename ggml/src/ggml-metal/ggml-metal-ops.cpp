@@ -40,6 +40,7 @@ struct ggml_metal_op {
         int  debug_fusion) {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
+        this->cmd_buf         = cmd_buf;
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->idx_start       = idx_start;
@@ -66,8 +67,10 @@ struct ggml_metal_op {
     }
 
     ~ggml_metal_op() {
-        ggml_metal_encoder_end_encoding(this->enc);
-        ggml_metal_encoder_free(this->enc);
+        if (this->enc) {
+            ggml_metal_encoder_end_encoding(this->enc);
+            ggml_metal_encoder_free(this->enc);
+        }
         ggml_mem_ranges_free(this->mem_ranges);
     }
 
@@ -97,8 +100,23 @@ struct ggml_metal_op {
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
     }
 
+    // Command-buffer level work (a shared-event signal or wait) cannot be encoded while a compute
+    // encoder is active, so the encoder has to be closed around it and a fresh one opened after.
+    // Closing an encoder is itself a full barrier, so the concurrency ranges start over.
+    void encoder_end() {
+        ggml_metal_encoder_end_encoding(enc);
+        ggml_metal_encoder_free(enc);
+        enc = nullptr;
+    }
+
+    void encoder_start() {
+        enc = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+        ggml_mem_ranges_reset(mem_ranges);
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
+    ggml_metal_cmd_buf_t cmd_buf;
     ggml_metal_encoder_t enc;
     ggml_mem_ranges_t    mem_ranges;
 
@@ -457,6 +475,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_TIMESTEP_EMBEDDING:
             {
                 n_fuse = ggml_metal_op_timestep_embedding(ctx, idx);
+            } break;
+        case GGML_OP_MOE_SLOT_RESOLVE:
+            {
+                n_fuse = ggml_metal_op_moe_slot_resolve(ctx, idx);
             } break;
         case GGML_OP_ARGSORT:
             {
@@ -5161,6 +5183,74 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_moe_slot_resolve(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(op->op == GGML_OP_MOE_SLOT_RESOLVE);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_I32);
+    GGML_ASSERT(op->src[1]->type == GGML_TYPE_I32);
+    GGML_ASSERT(op->type         == GGML_TYPE_I32);
+
+    const int32_t n_expert = ggml_get_op_params_i32(op, 0);
+    const int32_t n_slots  = ggml_get_op_params_i32(op, 1);
+    const int32_t layer    = ggml_get_op_params_i32(op, 2);
+    const int32_t mode     = ggml_get_op_params_i32(op, 3);
+
+    ggml_metal_kargs_moe_slot_resolve args = {
+        /*.n        =*/ (int32_t) ggml_nelements(op->src[0]),
+        /*.n_expert =*/ n_expert,
+        /*.n_slots  =*/ n_slots,
+        /*.mode     =*/ mode,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_moe_slot_resolve(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2] ? op->src[2] : op->src[0]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4);
+
+    if (mode >= 3) {
+        // one thread owns residency, so there is nothing to parallelise
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
+    } else {
+        const int nth = std::min(64, (int) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (args.n + nth - 1)/nth, 1, 1, nth, 1, 1);
+    }
+
+    // mode 4 is a TIMING PROBE ONLY: residency on the GPU with no handshake, so the GEMM can read
+    // a slot before it is filled. It exists to separate the cost of the removed graph splits from
+    // the cost of the handshake that replaced them.
+    if (mode == 3) {
+        // Hand the request list to the CPU and block here until it has loaded the slabs. This is
+        // what replaces the graph split the CPU remap op used to force: ~34 us of shared-event
+        // round trip against ~930 us of sched drain, input copies and re-submission.
+        uint64_t v = 0;
+
+        ggml_metal_event_t ev = ggml_metal_device_moe_handshake(
+                ctx->dev, ggml_backend_tensor_get_host_ptr(op->src[1]), layer, &v);
+
+        if (!ev) {
+            // without the handshake the GEMM would read slots that were never filled, and it would
+            // do it quietly - fail instead
+            GGML_ABORT("MOE_SLOT_RESOLVE owns residency but no CPU servicer is registered");
+        }
+
+        ctx->encoder_end();
+        ggml_metal_event_encode_signal_value(ev, ctx->cmd_buf, v);
+        ggml_metal_event_encode_wait_value  (ev, ctx->cmd_buf, v + 1);
+        ctx->encoder_start();
+    }
 
     return 1;
 }

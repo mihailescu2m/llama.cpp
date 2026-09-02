@@ -827,6 +827,19 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     });
 }
 
+void ggml_metal_set_moe_servicer(ggml_metal_t ctx, ggml_metal_moe_servicer_t fn, void * user_data) {
+    ggml_metal_device_set_moe_servicer(ctx->dev, fn, user_data);
+
+    // The servicer's shared-event values are handed out in ENCODE order, so encode order has to be
+    // commit order. With more than one command buffer per graph the encoding threads interleave and
+    // a wait could be released by an unrelated later signal, which would let a GEMM read a slab
+    // that was never loaded. One command buffer was measured to cost nothing (n_cb 1 vs 4: 19.33 s
+    // vs 18.65 s of GPU time, identical wall clock), so pin it.
+    if (fn) {
+        ggml_metal_set_n_cb(ctx, 1);
+    }
+}
+
 void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data) {
     ctx->abort_callback = abort_callback;
     ctx->abort_callback_data = user_data;

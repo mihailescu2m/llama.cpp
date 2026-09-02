@@ -1471,6 +1471,7 @@ static const ggml_backend_buffer_i ggml_backend_riscv64_spacemit_buffer_i = {
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_riscv64_spacemit_buffer_clear,
     /* .reset           = */ nullptr,
+    /* .get_host_ptr    = */ nullptr,
 };
 
 static const char * ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name(ggml_backend_buffer_type_t buft) {

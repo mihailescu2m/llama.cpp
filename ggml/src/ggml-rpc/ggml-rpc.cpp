@@ -772,6 +772,7 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_rpc_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_rpc_buffer_clear,
     /* .reset           = */ NULL,
+    /* .get_host_ptr    = */ NULL,
 };
 
 static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t buft) {

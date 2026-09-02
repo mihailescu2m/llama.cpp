@@ -1187,6 +1187,13 @@ typedef struct {
 } ggml_metal_kargs_argsort;
 
 typedef struct {
+    int32_t n;         // number of selected (token, expert) pairs
+    int32_t n_expert;  // experts the router chooses from
+    int32_t n_slots;   // expert cache slots in this layer
+    int32_t mode;      // 1 = verify against src[2], 3 = the GPU owns residency
+} ggml_metal_kargs_moe_slot_resolve;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

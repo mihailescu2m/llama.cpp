@@ -65,6 +65,33 @@ struct llama_moe_stream_weight {
 
 struct llama_moe_stream_layer;
 
+// Element layout of a layer's GPU residency buffer. Kept in one place because the Metal kernel
+// indexes the same buffer with the same arithmetic and the two must not drift.
+//
+//   [0,           n_slots)            slot -> expert id, -1 = empty
+//   [n_slots,   2*n_slots)            slot -> last-use stamp (compare as a wrapping difference)
+//   [2*n_slots, 2*n_slots + n_expert) expert -> slot, -1 = not resident
+//   tail                              MOE_SLOT_TAIL_COUNT counters
+//   requests                          up to n_slots (expert, slot) pairs the CPU must load
+struct llama_moe_slot_state_layout {
+    int32_t n_expert = 0;
+    int32_t n_slots  = 0;
+
+    int32_t off_slot_expert() const { return 0; }
+    int32_t off_last_use()    const { return n_slots; }
+    int32_t off_expert_slot() const { return 2*n_slots; }
+    int32_t off_tail()        const { return 2*n_slots + n_expert; }
+    int32_t off_requests()    const { return off_tail() + 4; }
+    int32_t size()            const { return off_requests() + 2*n_slots; }
+};
+
+enum llama_moe_slot_tail {
+    MOE_SLOT_TAIL_CLOCK = 0, // monotonic use counter; the GPU owns it at mode 3
+    MOE_SLOT_TAIL_NREQ  = 1, // (expert, slot) pairs the kernel emitted this call
+    MOE_SLOT_TAIL_NBAD  = 2, // verify mismatches, mode 1 only
+    MOE_SLOT_TAIL_SEQ   = 3, // call sequence, so a servicer can spot a missed handshake
+};
+
 // Userdata for the remap op when one-layer-ahead prefetch is on. The op keeps its normal job for
 // THIS layer and additionally predicts the NEXT layer's routing from this layer's router input,
 // issuing those loads a layer early.
@@ -155,6 +182,21 @@ struct llama_moe_stream_layer {
     bool matches(const ggml_tensor * gate, const ggml_tensor * up,
                  const ggml_tensor * down, const ggml_tensor * gate_up) const;
 
+    // Device-resident residency state for GPU slot resolution (LLAMA_MOE_STREAM_GPU_SLOT), one I32
+    // buffer per streamed layer. At mode 3 the GPU owns every field here and the CPU only services
+    // the requests the kernel emits; see llama_moe_slot_state_layout for the element layout.
+    ggml_tensor * state      = nullptr;
+    int32_t *     state_host = nullptr; // resolved lazily, null until the buffer is real
+    bool          state_init = false;   // the buffer starts as garbage - do not read counters yet
+
+    llama_moe_slot_state_layout layout() const { return { (int32_t) n_expert, (int32_t) n_slots }; }
+
+    void publish_state_locked(llama_moe_stream & mgr);
+
+    // mode 3: load whatever the resolve kernel asked for, then let the GPU continue. Runs on
+    // Metal's listener queue, NOT on the graph thread.
+    void service_requests(llama_moe_stream & mgr);
+
     // one-layer-ahead prefetch (LLAMA_MOE_STREAM_LOOKAHEAD=K). Set by the model at load time so
     // build_moe_ffn can reach the NEXT layer's router without a signature change.
     ggml_tensor * la_gate_inp = nullptr;   // next layer's ffn_gate_inp
@@ -234,6 +276,13 @@ struct llama_moe_stream {
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
     std::vector<ggml_backend_buffer_ptr> bufs;
 
+    // The GPU slot tables get their own context and buffer, so that turning the feature on leaves
+    // the expert-cache buffer byte-for-byte as it is with the feature off. Sharing the cache
+    // context would interleave a small I32 tensor between a layer's expert slabs.
+    ggml_backend_buffer_type_t buft_state = nullptr;
+    ggml_context_ptr         ctx_state;
+    ggml_backend_buffer_ptr  buf_state;
+
     // load pool (queue and all layer residency state guarded by mtx)
     mutable std::mutex      mtx;
     std::condition_variable cv_work; // queued work or shutdown
@@ -241,12 +290,36 @@ struct llama_moe_stream {
 
     std::deque<llama_moe_stream_work> q_demand;
 
+    // Speculative loads (lookahead and hash prefetch) live in their OWN queue, drained only when
+    // nothing is being waited on. With a single FIFO a wide prefetch delays the demand read a layer
+    // is blocked on: measured at lookahead K=16, misses/remap fell 0.251 -> 0.172 but read latency
+    // rose 1.69 -> 2.17 ms/slab and decode fell 8.45 -> 5.73 t/s. Separating them lets prefetch
+    // width cost bandwidth (of which the drive has ~6x spare) instead of demand latency.
+    std::deque<llama_moe_stream_work> q_spec;
+
+    // cap the speculative backlog: a prefetch that is still queued when its layer arrives has done
+    // nothing but reserve a slot and burn bandwidth
+    size_t q_spec_max = 0;
+
     std::vector<std::thread> workers;
     bool workers_started = false;
     bool shutting_down   = false;
     bool load_failed     = false;
 
     bool debug = false;
+
+    // GPU slot resolution (LLAMA_MOE_STREAM_GPU_SLOT): 0 off, 1 verify (the CPU remap still decides
+    // and its answer is what reaches the GEMM, the kernel only checks itself against it), 2 publish
+    // the table but insert no graph node - isolates the cost of the state buffer from the kernel.
+    // LLAMA_MOE_STREAM_LRU: drop route hotness and evict purely by last use. Prerequisite for
+    // moving residency to the GPU - hotness has no cheap kernel form, an argmin over 113 slots
+    // does. Simulated at +11% misses.
+    bool pure_lru     = false;
+
+    int  gpu_slot     = 0;
+    int64_t n_slot_chk = 0; // remap calls whose table the kernel checked
+    int64_t n_slot_bad = 0; // of those, disagreements with the CPU - must stay 0
+    int     n_slot_warn = 0; // warnings printed, capped
 
     struct llama_moe_stream_stats {
         int64_t n_calls     = 0; // remap invocations
@@ -318,14 +391,25 @@ struct llama_moe_stream {
     void worker_loop();
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+    void promote_slot_locked(llama_moe_stream_layer & sl, int32_t slot);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
-    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n, uint32_t n_ids);
+    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n);
     void plan_pairs_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
     void emit_wave_pairs(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_pairs, int64_t chunk); // the 4 index rows
     void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids); // make wave w resident + preload next
     void emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_tok); // write the slot ids
 };
+
+// Metal servicer entry point (LLAMA_MOE_STREAM_GPU_SLOT=3). Runs on Metal's listener queue with
+// the GPU stalled, so it must do the reads and return. user_data is the llama_moe_stream.
+void llama_moe_stream_service_gpu(void * user_data, void * state_host, int32_t layer);
+
+// how many tokens a ubatch may carry for the GPU to own residency. Decode and speculative
+// verification only: the kernel resolves the pair list serially in one thread, which is the right
+// trade for a handful of pairs and the wrong one for a 4096-token prefill. Prefill keeps the CPU
+// path, where one graph serves the whole ubatch and the split costs almost nothing anyway.
+static const int32_t LLAMA_MOE_GPU_SLOT_MAX_TOKENS = 32;
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);

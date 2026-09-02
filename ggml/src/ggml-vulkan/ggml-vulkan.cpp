@@ -16513,6 +16513,7 @@ static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_vk_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_vk_buffer_clear,
     /* .reset           = */ NULL,
+    /* .get_host_ptr    = */ NULL,
 };
 
 // vk buffer type

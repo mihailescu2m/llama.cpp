@@ -318,6 +318,7 @@ static ggml_backend_buffer_i ggml_backend_zdnn_buffer_i = {
     /* .cpy_tensor    = */ NULL,
     /* .clear         = */ ggml_backend_zdnn_buffer_clear,
     /* .reset         = */ NULL,
+    /* .get_host_ptr  = */ NULL,
 };
 
 //

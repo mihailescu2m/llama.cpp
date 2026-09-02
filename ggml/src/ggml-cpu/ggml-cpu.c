@@ -2161,6 +2161,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_MOE_SLOT_RESOLVE:
+            {
+                GGML_ABORT("MOE_SLOT_RESOLVE is only implemented by the Metal backend");
+            }
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");

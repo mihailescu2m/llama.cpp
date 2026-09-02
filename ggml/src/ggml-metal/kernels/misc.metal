@@ -593,3 +593,109 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// MoE expert-cache slot resolution, used by --moe-stream. Picks the cache slots a layer
+// needs and hands them to a CPU servicer over the shared-event handshake, replacing a graph
+// split (~34 us against ~930 us).
+kernel void kernel_moe_slot_resolve(
+        constant ggml_metal_kargs_moe_slot_resolve & args,
+        device const int32_t * ids,
+        device       int32_t * st,
+        device const int32_t * ref,
+        device       int32_t * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    device int32_t * slot_expert = st;
+    device int32_t * last_use    = st + args.n_slots;
+    device int32_t * expert_slot = st + 2*args.n_slots;
+    device int32_t * tail        = st + 2*args.n_slots + args.n_expert;
+    device int32_t * req         = tail + 4;
+
+    if (args.mode >= 3) {
+        if (tpig != 0) {
+            return;
+        }
+
+        const int32_t clock0 = tail[0];
+
+        int32_t clock = clock0;
+        int32_t nreq  = 0;
+        int32_t err   = 0;
+
+        for (int32_t i = 0; i < args.n; i++) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= args.n_expert) {
+                dst[i] = 0;
+                err    = 1;
+                continue;
+            }
+
+            int32_t s = expert_slot[e];
+
+            if (s < 0) {
+                // an empty slot if there is one, else the least recently used slot that this call
+                // has not already claimed. stamps are compared as wrapping differences.
+                int32_t v = -1;
+                for (int32_t k = 0; k < args.n_slots; k++) {
+                    if (slot_expert[k] < 0) {
+                        v = k;
+                        break;
+                    }
+                    if (last_use[k] - clock0 > 0) {
+                        continue; // claimed earlier in this same call
+                    }
+                    if (v < 0 || last_use[k] - last_use[v] < 0) {
+                        v = k;
+                    }
+                }
+
+                if (v < 0) {
+                    // more distinct experts than slots; the servicer turns this into an abort
+                    dst[i] = 0;
+                    err    = 1;
+                    continue;
+                }
+
+                const int32_t old = slot_expert[v];
+                if (old >= 0) {
+                    expert_slot[old] = -1;
+                }
+                slot_expert[v] = e;
+                expert_slot[e] = v;
+
+                req[2*nreq + 0] = e;
+                req[2*nreq + 1] = v;
+                nreq++;
+
+                s = v;
+            }
+
+            clock++;
+            last_use[s] = clock;
+            dst[i]      = s;
+        }
+
+        tail[0] = clock;
+        tail[1] = nreq;
+        tail[2] = err;
+        tail[3] = tail[3] + 1;
+
+        return;
+    }
+
+    if ((int32_t) tpig >= args.n) {
+        return;
+    }
+
+    const int32_t e = ids[tpig];
+    const int32_t s = (e >= 0 && e < args.n_expert) ? expert_slot[e] : -1;
+
+    if (args.mode == 1) {
+        if (s != ref[tpig]) {
+            device atomic_int * n_bad = (device atomic_int *) (tail + 2);
+            atomic_fetch_add_explicit(n_bad, 1, memory_order_relaxed);
+        }
+        dst[tpig] = ref[tpig];
+    } else {
+        dst[tpig] = s;
+    }
+}

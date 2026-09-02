@@ -1898,7 +1898,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 const uint32_t k = e ? (uint32_t) std::max(0, atoi(e))
                                      : (uint32_t) hparams.n_expert_used;
                 uint32_t n_la = 0;
-                for (uint32_t il = 0; k > 0 && il + 1 < n_layer_all; il++) {
+                for (uint32_t il = 0; k > 0 && il + 1 < (uint32_t) n_layer_all; il++) {
                     auto * sl   = pimpl->moe_stream->layer(il);
                     auto * next = pimpl->moe_stream->layer(il + 1);
                     if (!sl || !next || il + 1 < hparams.dsv4_hash_layer_count) {
