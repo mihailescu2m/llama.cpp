@@ -84,9 +84,14 @@ static bool slot_ckpt_read(std::ifstream & file, T & value) {
     return (bool) file.read(reinterpret_cast<char *>(&value), sizeof(value));
 }
 
-static bool slot_ckpt_read_blob(std::ifstream & file, std::vector<uint8_t> & blob) {
+// `left` is how many bytes remain in the file. Without it a truncated sidecar - power loss, a full
+// disk, a killed server - can declare a 4 GiB blob and resize() commits that allocation BEFORE the
+// read discovers the bytes are not there. The throw is caught, so it is not a crash, but a 4 GiB
+// transient on a box already near its memory ceiling is enough to start paging, and a truncated
+// sidecar is exactly what the situations that produce one leave behind.
+static bool slot_ckpt_read_blob(std::ifstream & file, std::vector<uint8_t> & blob, uint64_t left) {
     uint64_t size = 0;
-    if (!slot_ckpt_read(file, size) || size > SLOT_CKPT_MAX_BLOB) {
+    if (!slot_ckpt_read(file, size) || size > SLOT_CKPT_MAX_BLOB || size > left) {
         return false;
     }
     blob.resize(size);
@@ -223,15 +228,21 @@ static size_t slot_ckpt_load(
 
         std::list<common_prompt_checkpoint> loaded;
         for (uint32_t i = 0; i < count; ++i) {
+            // recomputed per blob: each read advances the position, so the bound tightens
+            auto left = [&]() -> uint64_t {
+                const std::streampos at = file.tellg();
+                return at < 0 || (uint64_t) at > file_size ? 0 : file_size - (uint64_t) at;
+            };
+
             common_prompt_checkpoint checkpoint;
             if (!slot_ckpt_read(file, checkpoint.n_tokens) ||
                 !slot_ckpt_read(file, checkpoint.pos_min) ||
                 !slot_ckpt_read(file, checkpoint.pos_max) ||
                 checkpoint.n_tokens < 0 || checkpoint.n_tokens > (int64_t) prompt_tokens ||
                 checkpoint.pos_min < 0 || checkpoint.pos_max < checkpoint.pos_min ||
-                !slot_ckpt_read_blob(file, checkpoint.data_tgt) || checkpoint.data_tgt.empty() ||
-                !slot_ckpt_read_blob(file, checkpoint.data_dft) ||
-                !slot_ckpt_read_blob(file, checkpoint.data_spec)) {
+                !slot_ckpt_read_blob(file, checkpoint.data_tgt, left()) || checkpoint.data_tgt.empty() ||
+                !slot_ckpt_read_blob(file, checkpoint.data_dft, left()) ||
+                !slot_ckpt_read_blob(file, checkpoint.data_spec, left())) {
                 return 0;
             }
             loaded.push_back(std::move(checkpoint));
