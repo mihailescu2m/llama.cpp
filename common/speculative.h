@@ -73,6 +73,9 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// reset per-sequence carry state before rebuilding a draft context from an uncached prompt
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 

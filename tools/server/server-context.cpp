@@ -23,6 +23,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <list>
 #include <random>
 #include <utility>
 #include <fstream>
@@ -37,6 +38,216 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Context checkpoints are server state and are not part of llama_state_seq_save_file(). Keep
+// them in a best-effort sidecar so an SWA slot can resume near the end of its prompt after a
+// restart instead of reprocessing from position zero.
+static constexpr uint32_t SLOT_CKPT_MAGIC     = 0x4b435453; // "STCK"
+static constexpr uint32_t SLOT_CKPT_VERSION   = 2;
+static constexpr uint32_t SLOT_CKPT_MAX       = 64;
+static constexpr uint64_t SLOT_CKPT_MAX_BLOB  = 4ull  << 30;
+static constexpr uint64_t SLOT_CKPT_MAX_TOTAL = 16ull << 30;
+
+static std::string slot_ckpt_path(const std::string & filepath) {
+    return filepath + ".ckpt";
+}
+
+static uint64_t slot_ckpt_hash(const void * data, size_t size) {
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+template <typename T>
+static bool slot_ckpt_write(std::ofstream & file, const T & value) {
+    file.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    return (bool) file;
+}
+
+static bool slot_ckpt_write_blob(std::ofstream & file, const std::vector<uint8_t> & blob) {
+    const uint64_t size = blob.size();
+    if (size > SLOT_CKPT_MAX_BLOB || !slot_ckpt_write(file, size)) {
+        return false;
+    }
+    if (size > 0) {
+        file.write(reinterpret_cast<const char *>(blob.data()), size);
+    }
+    return (bool) file;
+}
+
+template <typename T>
+static bool slot_ckpt_read(std::ifstream & file, T & value) {
+    return (bool) file.read(reinterpret_cast<char *>(&value), sizeof(value));
+}
+
+static bool slot_ckpt_read_blob(std::ifstream & file, std::vector<uint8_t> & blob) {
+    uint64_t size = 0;
+    if (!slot_ckpt_read(file, size) || size > SLOT_CKPT_MAX_BLOB) {
+        return false;
+    }
+    blob.resize(size);
+    return size == 0 || (bool) file.read(reinterpret_cast<char *>(blob.data()), size);
+}
+
+// Returns bytes written. A failure is non-fatal because the main state file is already complete;
+// removing the previous sidecar first ensures a failed or checkpoint-free save cannot reuse stale
+// checkpoint data on the next restore.
+static size_t slot_ckpt_save(
+        const std::string & filepath,
+        const void * prompt_data,
+        size_t prompt_size,
+        size_t prompt_tokens,
+        const std::list<common_prompt_checkpoint> & checkpoints) {
+    const std::string path = slot_ckpt_path(filepath);
+    const std::string path_tmp = path + ".tmp";
+
+    std::error_code error;
+    std::filesystem::remove(path_tmp, error);
+    error.clear();
+    std::filesystem::remove(path, error);
+
+    if (checkpoints.empty()) {
+        return 0;
+    }
+
+    const uint32_t count = (uint32_t) std::min<size_t>(checkpoints.size(), SLOT_CKPT_MAX);
+    size_t skip = checkpoints.size() - count;
+    uint64_t total = 0;
+    for (const auto & checkpoint : checkpoints) {
+        if (skip > 0) {
+            --skip;
+            continue;
+        }
+        if (checkpoint.data_tgt.size() > SLOT_CKPT_MAX_BLOB ||
+            checkpoint.data_dft.size() > SLOT_CKPT_MAX_BLOB ||
+            checkpoint.data_spec.size() > SLOT_CKPT_MAX_BLOB ||
+            checkpoint.size() > SLOT_CKPT_MAX_TOTAL - total) {
+            return 0;
+        }
+        total += checkpoint.size();
+    }
+    if (total > SLOT_CKPT_MAX_TOTAL) {
+        return 0;
+    }
+
+    std::ofstream file(path_tmp, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return 0;
+    }
+    if (
+        !slot_ckpt_write(file, SLOT_CKPT_MAGIC) ||
+        !slot_ckpt_write(file, SLOT_CKPT_VERSION) ||
+        !slot_ckpt_write(file, count) ||
+        !slot_ckpt_write(file, (uint64_t) prompt_size) ||
+        !slot_ckpt_write(file, (uint64_t) prompt_tokens) ||
+        !slot_ckpt_write(file, slot_ckpt_hash(prompt_data, prompt_size))) {
+        file.close();
+        std::filesystem::remove(path_tmp, error);
+        return 0;
+    }
+
+    skip = checkpoints.size() - count;
+    for (const auto & checkpoint : checkpoints) {
+        if (skip > 0) {
+            --skip;
+            continue;
+        }
+
+        if (!slot_ckpt_write(file, checkpoint.n_tokens) ||
+            !slot_ckpt_write(file, checkpoint.pos_min) ||
+            !slot_ckpt_write(file, checkpoint.pos_max) ||
+            !slot_ckpt_write_blob(file, checkpoint.data_tgt) ||
+            !slot_ckpt_write_blob(file, checkpoint.data_dft) ||
+            !slot_ckpt_write_blob(file, checkpoint.data_spec)) {
+            file.close();
+            std::filesystem::remove(path_tmp, error);
+            return 0;
+        }
+    }
+
+    const std::streampos end = file.tellp();
+    file.close();
+    if (!file || end < 0) {
+        std::filesystem::remove(path_tmp, error);
+        return 0;
+    }
+
+    error.clear();
+    std::filesystem::rename(path_tmp, path, error);
+    if (error) {
+        std::filesystem::remove(path_tmp, error);
+        return 0;
+    }
+
+    return (size_t) end;
+}
+
+// Returns the number of recovered checkpoints. Missing, stale, or malformed sidecars preserve the
+// upstream behavior: the checkpoint list stays empty and prompt reuse may fall back to a re-prefill.
+static size_t slot_ckpt_load(
+        const std::string & filepath,
+        const void * prompt_data,
+        size_t prompt_size,
+        size_t prompt_tokens,
+        std::list<common_prompt_checkpoint> & checkpoints) {
+    checkpoints.clear();
+
+    const std::string path = slot_ckpt_path(filepath);
+    std::error_code error;
+    const uint64_t file_size = std::filesystem::file_size(path, error);
+    if (error || file_size > SLOT_CKPT_MAX_TOTAL) {
+        return 0;
+    }
+
+    try {
+        std::ifstream file(path, std::ios::binary);
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        uint32_t count = 0;
+        uint64_t saved_prompt_size = 0;
+        uint64_t saved_prompt_tokens = 0;
+        uint64_t saved_prompt_hash = 0;
+        if (!file ||
+            !slot_ckpt_read(file, magic) || magic != SLOT_CKPT_MAGIC ||
+            !slot_ckpt_read(file, version) || version != SLOT_CKPT_VERSION ||
+            !slot_ckpt_read(file, count) || count > SLOT_CKPT_MAX ||
+            !slot_ckpt_read(file, saved_prompt_size) || saved_prompt_size != prompt_size ||
+            !slot_ckpt_read(file, saved_prompt_tokens) || saved_prompt_tokens != prompt_tokens ||
+            !slot_ckpt_read(file, saved_prompt_hash) || saved_prompt_hash != slot_ckpt_hash(prompt_data, prompt_size)) {
+            return 0;
+        }
+
+        std::list<common_prompt_checkpoint> loaded;
+        for (uint32_t i = 0; i < count; ++i) {
+            common_prompt_checkpoint checkpoint;
+            if (!slot_ckpt_read(file, checkpoint.n_tokens) ||
+                !slot_ckpt_read(file, checkpoint.pos_min) ||
+                !slot_ckpt_read(file, checkpoint.pos_max) ||
+                checkpoint.n_tokens < 0 || checkpoint.n_tokens > (int64_t) prompt_tokens ||
+                checkpoint.pos_min < 0 || checkpoint.pos_max < checkpoint.pos_min ||
+                !slot_ckpt_read_blob(file, checkpoint.data_tgt) || checkpoint.data_tgt.empty() ||
+                !slot_ckpt_read_blob(file, checkpoint.data_dft) ||
+                !slot_ckpt_read_blob(file, checkpoint.data_spec)) {
+                return 0;
+            }
+            loaded.push_back(std::move(checkpoint));
+        }
+
+        if (file.peek() != std::ifstream::traits_type::eof()) {
+            return 0;
+        }
+
+        checkpoints = std::move(loaded);
+        return checkpoints.size();
+    } catch (const std::exception &) {
+        checkpoints.clear();
+        return 0;
+    }
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -249,7 +460,10 @@ struct server_slot {
     mtmd::batch_ptr mbatch = nullptr;
 
     // speculative decoding
-    common_speculative * spec;
+    common_speculative * spec = nullptr;
+
+    int32_t spec_n_prompt_max = 0;
+    bool spec_context_synced = true;
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -335,6 +549,8 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_reset(spec, id);
+        spec_context_synced = true;
 
         prompt.clear();
     }
@@ -471,6 +687,11 @@ struct server_slot {
         return !!spec;
     }
 
+    bool wants_speculation() const {
+        return can_speculate() &&
+            (spec_n_prompt_max == 0 || task == nullptr || task->n_tokens() <= spec_n_prompt_max);
+    }
+
     void add_token(const completion_token_output & token) {
         if (!is_processing()) {
             SLT_WRN(*this, "%s", "slot is not processing\n");
@@ -483,7 +704,7 @@ struct server_slot {
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
-        if (!can_speculate()) {
+        if (!wants_speculation()) {
             return 0;
         }
 
@@ -689,7 +910,7 @@ struct server_slot {
         res = {
             {"id",            id},
             {"n_ctx",         n_ctx},
-            {"speculative",   can_speculate()},
+            {"speculative",   wants_speculation()},
             {"is_processing", is_processing()},
         };
 
@@ -1293,6 +1514,7 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+            slot.spec_n_prompt_max = params_base.speculative.n_prompt_max;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -2552,6 +2774,18 @@ private:
                         break;
                     }
 
+                    const size_t nwrite_ckpt = slot_ckpt_save(
+                            filepath,
+                            packed.data(), packed.size(),
+                            slot->prompt.tokens.size(),
+                            slot->prompt.checkpoints);
+                    if (!slot->prompt.checkpoints.empty() && nwrite_ckpt == 0) {
+                        SRV_WRN("slot save: checkpoint sidecar write failed; restore will fall back to re-prefill\n");
+                    } else {
+                        SRV_INF("slot save: %zu checkpoint(s), %.2f MiB sidecar\n",
+                                slot->prompt.checkpoints.size(), (double) nwrite_ckpt / 1024.0 / 1024.0);
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2609,8 +2843,23 @@ private:
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
+                        std::list<common_prompt_checkpoint> checkpoints;
+                        const size_t n_ckpt = slot_ckpt_load(
+                                filepath,
+                                packed.data(), packed.size() * sizeof(llama_token),
+                                restored.size(),
+                                checkpoints);
+
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->prompt.checkpoints = std::move(checkpoints);
+
+                        // The main state file does not contain the current draft context. Even when
+                        // checkpoints were recovered, force a synchronized prefill before a later
+                        // request enables speculation; target-only use can consume them immediately.
+                        slot->spec_context_synced = spec == nullptr;
+
+                        SRV_INF("slot restore: %zu checkpoint(s) recovered\n", n_ckpt);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -2977,7 +3226,7 @@ private:
                 const int n_draft_max = slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
-                    GGML_ASSERT(slot.can_speculate());
+                    GGML_ASSERT(slot.wants_speculation());
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
@@ -3136,6 +3385,17 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        // A long request may have advanced only the target context while its draft
+                        // prefill was intentionally skipped. If speculation becomes worthwhile again,
+                        // rebuild both contexts from position zero instead of pairing a cached target
+                        // prefix with stale draft state.
+                        const bool force_spec_prefill = slot.wants_speculation() && !slot.spec_context_synced;
+                        if (force_spec_prefill) {
+                            SLT_INF(slot, "%s", "rebuilding prompt to synchronize the speculative context\n");
+                            common_speculative_reset(spec.get(), slot.id);
+                            slot.spec_context_synced = true;
+                        }
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -3187,7 +3447,7 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt && !force_spec_prefill) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3732,7 +3992,19 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        bool batch_wants_speculation = false;
         if (spec) {
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                GGML_ASSERT(batch_view.n_seq_id[i] == 1);
+                const llama_seq_id seq_id = batch_view.seq_id[i][0];
+                if (seq_id >= 0 && seq_id < (llama_seq_id) slots.size() && slots[seq_id].wants_speculation()) {
+                    batch_wants_speculation = true;
+                    break;
+                }
+            }
+        }
+
+        if (batch_wants_speculation) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
@@ -3743,6 +4015,15 @@ private:
 
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
+            }
+        } else if (spec) {
+            // The target advanced without the draft. Remember the gap so a future short request
+            // cannot reuse this target prefix with an unsynchronized draft context.
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                const llama_seq_id seq_id = batch_view.seq_id[i][0];
+                if (seq_id >= 0 && seq_id < (llama_seq_id) slots.size()) {
+                    slots[seq_id].spec_context_synced = false;
+                }
             }
         }
 
@@ -3827,14 +4108,14 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                if (slot.can_speculate()) {
+                if (slot.wants_speculation()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
 
-            if (slot.can_speculate() && !slot.spec_draft.empty()) {
+            if (slot.wants_speculation() && !slot.spec_draft.empty()) {
                 return; // sample using speculative decoding
             }
 
@@ -3887,7 +4168,7 @@ private:
 
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
+            if (slot.state != SLOT_STATE_GENERATING || !slot.wants_speculation() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
             }

@@ -373,6 +373,10 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // Disable speculation for requests whose input prompt exceeds this length (0 = unlimited).
+    // Model-backed draft prefill can cost more than it saves for short answers at long context.
+    int32_t n_prompt_max = 0;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
@@ -393,7 +397,10 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;

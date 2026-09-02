@@ -14,9 +14,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <cinttypes>
 
@@ -54,6 +57,23 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
         result += ggml_backend_dev_name(devices[i]);
     }
     return result.empty() ? "default" : result;
+}
+
+static uint32_t common_speculative_env_u32(const char * name, uint32_t fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > std::numeric_limits<uint32_t>::max()) {
+        SPC_WRN("ignoring invalid %s='%s'\n", name, value);
+        return fallback;
+    }
+
+    return (uint32_t) parsed;
 }
 
 struct common_speculative_config {
@@ -162,6 +182,8 @@ struct common_speculative_impl {
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
     virtual ~common_speculative_impl() = default;
+
+    virtual void reset(llama_seq_id /*seq_id*/) {}
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
@@ -567,6 +589,18 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 2);
         }
+    }
+
+    void reset(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_g_last[seq_id].begin(), pending_g_last[seq_id].end(), 0.0f);
+        pending_pos_last[seq_id] = -1;
+        verify_g[seq_id].clear();
+        verify_pos_first[seq_id] = -1;
+        verify_g_rows[seq_id] = 0;
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -1472,6 +1506,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     "(need_embd / logits=1 on every prompt position?). "
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 1);
+        }
+    }
+
+    void reset(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        i_last[seq_id] = -1;
+        i_batch_beg[seq_id] = -1;
+        i_batch_end[seq_id] = -1;
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        if (chain_heads) {
+            chain_h[seq_id].clear();
         }
     }
 
@@ -2521,9 +2571,25 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_block = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    // The draft inherits the target's expert-cache budget. For a small MoE drafter that can
+    // accidentally cover every expert, disable streaming, and consume memory needed by the target.
+    // Zero keeps the inherited setting.
+    if (mparams.moe_stream) {
+        const uint32_t slots = common_speculative_env_u32("LLAMA_SPEC_DRAFT_MOE_SLOTS", 96);
+        if (slots > 0) {
+            mparams.moe_stream_slots  = slots;
+            mparams.moe_stream_budget = 0;
+        }
+    }
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -2536,6 +2602,31 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // DFlash and DSpark chunk target prompt batches into their own ubatches in process(). Their
+    // draft step only needs n_seq*(n_max + 1) rows, so carrying the target's large batch buffers
+    // wastes GBs for an MoE drafter. Do not apply this to draft-simple, whose process() forwards
+    // the target batch directly and therefore must retain the target's n_batch acceptance bound.
+    if (spec_block) {
+        const uint64_t n_draft_rows =
+                (uint64_t) cparams.n_seq_max * (uint64_t) (std::max(0, params.speculative.draft.n_max) + 1);
+        const uint32_t n_batch_dft = (uint32_t) std::min<uint64_t>(
+                std::max<uint64_t>(512, n_draft_rows), std::numeric_limits<uint32_t>::max());
+
+        cparams.n_batch  = std::min(cparams.n_batch,  n_batch_dft);
+        cparams.n_ubatch = std::min(cparams.n_ubatch, n_batch_dft);
+    }
+
+    // MTP must accept the target's complete logical batch, but llama_decode can split it into
+    // smaller physical batches. Its 512-expert head and four residual streams make the target's
+    // large ubatch unnecessarily expensive. Zero keeps the target ubatch for A/B testing.
+    if (spec_mtp) {
+        const uint32_t n_ubatch_dft = common_speculative_env_u32("LLAMA_SPEC_DRAFT_UBATCH", 1024);
+        if (n_ubatch_dft > 0 && cparams.n_ubatch > n_ubatch_dft) {
+            SPC_INF("MTP draft ubatch %u -> %u\n", cparams.n_ubatch, n_ubatch_dft);
+            cparams.n_ubatch = n_ubatch_dft;
+        }
+    }
 
     std::string model_path;
     if (has_draft) {
@@ -2759,6 +2850,18 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size());
+    spec->dparams[seq_id] = {};
+    for (auto & impl : spec->impls) {
+        impl->reset(seq_id);
+    }
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
