@@ -9751,12 +9751,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_union(512, 4,  1, 1024, 64, 64, 0));
     test_cases.emplace_back(new test_flash_attn_union(512, 1,  2, 1024, 64, 64, 0));
     test_cases.emplace_back(new test_flash_attn_union(512, 2,  2, 1024, 64, 64, 0));
+
+    // Past the old 65536-row cap, where the path used to switch itself off. These run union_build's
+    // chunked bitmap inside a real attention op: one chunk exactly, and two chunks.
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64,  65536, 64, 128, 256));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 131072, 64, 128,   0));
     test_cases.emplace_back(new test_flash_attn_union(512, 4,  4, 1024, 64, 64, 0));
 
     for (int64_t n_csa : {1024, 4096, 32768}) {
         for (int64_t block : {4, 8}) {
             test_cases.emplace_back(new test_union_build(128, 65, n_csa, block));
         }
+    }
+
+    // The Metal kernel holds a fixed 2048-word (65536-row) threadgroup bitmap and walks the row
+    // space in chunks of that size. These straddle the chunk boundary: 65535 stops one row short,
+    // 65536 fills exactly one chunk, 65537 leaves a second chunk holding a single row (which the
+    // selections almost never hit, so it also exercises the empty-chunk skip), and 131072 is two
+    // full chunks. Union ids must stay globally ascending across chunks.
+    for (int64_t n_csa : {65535, 65536, 65537, 131072}) {
+        test_cases.emplace_back(new test_union_build(128, 65, n_csa, 8));
     }
 
     for (int k : {1, 63, 65}) {

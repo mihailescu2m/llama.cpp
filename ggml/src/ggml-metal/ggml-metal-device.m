@@ -2239,10 +2239,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    uids->nb[0] == sizeof(int32_t);
         }
         case GGML_OP_UNION_BUILD:
-            // The bitmap and prefix table use 16 KB at 65536 rows.
+            // The bitmap and prefix table use a fixed 16 KB, covering 65536 rows at a time; the
+            // kernel walks a larger row space in chunks of that size. The only bound left is the
+            // 24 bits the union packs a row id into, which ggml_union_build already asserts.
+            // NOTE: this check and the graph-side gate in deepseek4.cpp must agree - saying no here
+            // does not disable the path, it moves union_build to the CPU backend and adds a split.
             return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_I32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
-                   ggml_get_op_params_i32(op, 0) > 0 && ggml_get_op_params_i32(op, 0) <= 65536 &&
+                   ggml_get_op_params_i32(op, 0) > 0 && ggml_get_op_params_i32(op, 0) <= (1 << 24) &&
                    ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 1) <= 8;
         case GGML_OP_FLASH_ATTN_EXT:
             // for new head sizes, add checks here

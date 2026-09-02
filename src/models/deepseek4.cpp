@@ -5,6 +5,7 @@
 #include "llama-moe-stream.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
@@ -777,9 +778,39 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     const int64_t n_stream = csa_k->ne[3];
     const int64_t n_raw    = raw_k->ne[2];
 
-    if (union_enabled && sinks == nullptr && n_stream == 1 && cparams.flash_attn &&
+    // n_csa is no longer capped at 65536: kernel_union_build walks the row space in chunks, so the
+    // only bound left is the 24 bits the union packs an id into. The old cap turned the path off
+    // silently at exactly the contexts it was built for.
+    const bool union_ok =
+        union_enabled && sinks == nullptr && n_stream == 1 && cparams.flash_attn &&
         top_k->ne[0] < n_csa && n_tokens >= 8 && (n_raw % 64) == 0 &&
-        n_csa >= union_min_ncsa && n_csa <= 65536) {
+        n_csa >= union_min_ncsa && n_csa <= (1 << 24);
+
+    // A decline drops to dense attention, which is correct but much slower at long context, and
+    // used to leave no trace at all. Log the first one per reason so it is visible in a server log.
+    if (union_enabled && !union_ok) {
+        static uint32_t logged = 0;
+        const uint32_t reason =
+            sinks       != nullptr    ? 1u :
+            n_stream    != 1          ? 2u :
+            !cparams.flash_attn       ? 3u :
+            top_k->ne[0] >= n_csa     ? 4u :
+            n_tokens     < 8          ? 5u :
+            (n_raw % 64) != 0         ? 6u :
+            n_csa < union_min_ncsa    ? 7u : 8u;
+
+        // reasons 5 (decode) and 7 (short context) are the expected steady state, not news
+        if (reason != 5u && reason != 7u && (logged & (1u << reason)) == 0) {
+            logged |= 1u << reason;
+            LLAMA_LOG_WARN("%s: dsv4 union-8 declined (reason %u): n_csa = %" PRId64 ", top_k = %" PRId64
+                           ", n_tokens = %d, n_raw = %" PRId64 ", n_stream = %" PRId64
+                           ", fa = %d - falling back to dense attention\n",
+                    __func__, reason, n_csa, top_k->ne[0], (int) n_tokens, n_raw, n_stream,
+                    (int) cparams.flash_attn);
+        }
+    }
+
+    if (union_ok) {
         ggml_tensor * uids = ggml_union_build(ctx0, top_k, n_csa, 8);
         cb(uids, "csa_uids", il);
 
