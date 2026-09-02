@@ -301,6 +301,18 @@ typedef struct ggml_metal_event * ggml_metal_event_t;
 void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 void ggml_metal_event_encode_wait  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 
+// Explicit-value variants plus CPU-side signal and notification. These let the GPU hand work to a
+// CPU servicer and resume without the graph splitting: the GPU signals, a listener callback runs on
+// the CPU, and the CPU signals back. Round-trip latency is what decides whether that is worth doing
+// versus letting ggml_backend_sched split the graph, so measure it before relying on it.
+void ggml_metal_event_encode_signal_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf, uint64_t value);
+void ggml_metal_event_encode_wait_value  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf, uint64_t value);
+void ggml_metal_event_signal_cpu         (ggml_metal_event_t ev, uint64_t value);
+uint64_t ggml_metal_event_value          (ggml_metal_event_t ev);
+
+// invoke cb(user_data, value) on a private queue once the event reaches value
+void ggml_metal_event_notify(ggml_metal_event_t ev, uint64_t value, void (*cb)(void *, uint64_t), void * user_data);
+
 ggml_metal_device_t ggml_metal_device_init(int device, int n_devices);
 void ggml_metal_device_free(ggml_metal_device_t dev);
 

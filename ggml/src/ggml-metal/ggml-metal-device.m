@@ -1437,6 +1437,42 @@ void ggml_metal_event_encode_wait(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cm
     [cmd_buf encodeWaitForEvent:event value:atomic_load_explicit(&ev->value, memory_order_relaxed)];
 }
 
+void ggml_metal_event_encode_signal_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
+    [(id<MTLCommandBuffer>) cmd_buf_raw encodeSignalEvent:(id<MTLSharedEvent>)ev->obj value:value];
+}
+
+void ggml_metal_event_encode_wait_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
+    [(id<MTLCommandBuffer>) cmd_buf_raw encodeWaitForEvent:(id<MTLSharedEvent>)ev->obj value:value];
+}
+
+void ggml_metal_event_signal_cpu(ggml_metal_event_t ev, uint64_t value) {
+    ((id<MTLSharedEvent>)ev->obj).signaledValue = value;
+}
+
+uint64_t ggml_metal_event_value(ggml_metal_event_t ev) {
+    return ((id<MTLSharedEvent>)ev->obj).signaledValue;
+}
+
+static MTLSharedEventListener * ggml_metal_event_listener(void) {
+    // one private serial queue for every notification; the servicer must not block it
+    static MTLSharedEventListener * g_listener = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_t q = dispatch_queue_create("ggml-metal-event", DISPATCH_QUEUE_SERIAL);
+        g_listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:q];
+    });
+    return g_listener;
+}
+
+void ggml_metal_event_notify(ggml_metal_event_t ev, uint64_t value, void (*cb)(void *, uint64_t), void * user_data) {
+    [(id<MTLSharedEvent>)ev->obj notifyListener:ggml_metal_event_listener()
+                                        atValue:value
+                                          block:^(id<MTLSharedEvent> e, uint64_t v) {
+        GGML_UNUSED(e);
+        cb(user_data, v);
+    }];
+}
+
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
     id<MTLSharedEvent> event = [dev->mtl_device newSharedEvent];
 
