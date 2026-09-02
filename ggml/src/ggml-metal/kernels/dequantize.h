@@ -338,10 +338,14 @@ void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg
 
 template <typename type4>
 void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & reg) {
-    device const packed_char4 * qs = (device const packed_char4 *) xb->qs;
+    // q8_0 blocks and their quant data are 2-byte aligned, but not always 4-byte aligned.
+    device const packed_ushort2 * qs = (device const packed_ushort2 *) (xb->qs + 4*il);
+
+    const packed_ushort2 words = *qs;
+    const uint packed = as_type<uint>(ushort2(words[0], words[1]));
     const float d = xb->d;
 
-    reg = (type4) (float4(qs[il]) * d);
+    reg = (type4) (float4(as_type<char4>(packed)) * d);
 }
 
 template <typename type4x4>
