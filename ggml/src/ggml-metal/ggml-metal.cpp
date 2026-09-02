@@ -8,6 +8,8 @@
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
 
+#include <climits>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -577,6 +579,21 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
+static int ggml_backend_metal_configured_n_cb(void) {
+    const char * value = getenv("GGML_METAL_NCB");
+    if (value == NULL) {
+        return 1;
+    }
+
+    char * end = NULL;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 1) {
+        return 1;
+    }
+
+    return parsed > INT_MAX ? INT_MAX : (int) parsed;
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -620,7 +637,8 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    // Measurement-only override for pricing the graph's command-buffer split overhead.
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_configured_n_cb());
 
     return backend;
 }
@@ -723,7 +741,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_configured_n_cb());
 
     return backend;
 

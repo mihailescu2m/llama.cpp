@@ -112,8 +112,13 @@ int  ggml_metal_kprof_stride(void);
 // node index that starts the new segment. no-op (returns -1) when kprof is inactive.
 int  ggml_metal_encoder_kprof_split(ggml_metal_encoder_t encoder, int raw_node_idx);
 
+// Stable key for the node map emitted by KPROF, and metadata attachment for an encoder batch.
+// The key covers every emitted node-map field, so equal keys are safe to deduplicate.
+uint64_t ggml_metal_kprof_graph_key(const struct ggml_cgraph * gf);
+void ggml_metal_encoder_kprof_set_graph(ggml_metal_encoder_t encoder, uint64_t uid, uint64_t key);
+
 // resolve every completed segment recorded since the last flush and emit one `KPROF ` JSONL record
-// per segment on stderr. Must be called only after the owning command buffers have completed.
+// per segment on stderr. Batches whose command buffers are still running remain queued.
 void ggml_metal_kprof_flush(void);
 
 //

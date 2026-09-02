@@ -1,15 +1,27 @@
 #include "ggml-metal-device.h"
 
+#include <algorithm>
+#include <climits>
 #include <cstdlib>
 
 // occupancy probe: pad the iq3_xxs threadgroup allocation without the kernel using the extra
 // bytes. Changes residency per core only - arithmetic is untouched, so output is unchanged.
 static int ggml_metal_smem_pad_probe() {
-    static int pad = -1;
-    if (pad < 0) {
-        const char * e = getenv("GGML_METAL_SMEM_PAD");
-        pad = e ? atoi(e) : 0;
-    }
+    static const int pad = []() {
+        const char * value = getenv("GGML_METAL_SMEM_PAD");
+        if (value == nullptr) {
+            return 0;
+        }
+
+        char * end = nullptr;
+        long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed <= 0) {
+            return 0;
+        }
+
+        parsed = std::min(parsed, (long) INT_MAX - 15);
+        return (int) ((parsed + 15) & ~15L);
+    }();
     return pad;
 }
 

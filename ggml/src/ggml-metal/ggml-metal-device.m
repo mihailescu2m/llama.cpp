@@ -10,6 +10,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <pthread.h>
 
 #ifndef TARGET_OS_VISION
@@ -827,6 +828,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_kprof_batch {
     id<MTLCounterSampleBuffer> sb[GGML_METAL_KPROF_MAX_SB];
+    id<MTLCommandBuffer> cmd_buf;
+    uint64_t uid;
+    uint64_t key;
     int    n_sb;
     int  * nodes;   // raw graph node index that starts each segment
     int    n_seg;
@@ -844,7 +848,6 @@ static struct {
     int  n_failed_sb;
     int  seq;
     int  stride;
-    bool initialized;
 } g_kprof = {
     /*.mtx          =*/ PTHREAD_MUTEX_INITIALIZER,
     /*.pending      =*/ NULL,
@@ -855,34 +858,71 @@ static struct {
     /*.n_failed_sb  =*/ 0,
     /*.seq          =*/ 0,
     /*.stride       =*/ 0,
-    /*.initialized  =*/ false,
 };
 
-int ggml_metal_kprof_stride(void) {
-    if (!g_kprof.initialized) {
-        pthread_mutex_lock(&g_kprof.mtx);
-        if (!g_kprof.initialized) {
-            const char * v = getenv("GGML_METAL_KPROF");
-            g_kprof.stride = v ? atoi(v) : 0;
-            if (g_kprof.stride < 0) {
-                g_kprof.stride = 0;
-            }
-            g_kprof.initialized = true;
-        }
-        pthread_mutex_unlock(&g_kprof.mtx);
+static pthread_once_t g_kprof_once = PTHREAD_ONCE_INIT;
+
+static int ggml_metal_positive_env(const char * name) {
+    const char * value = getenv(name);
+    if (value == NULL) {
+        return 0;
     }
+
+    char * end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed <= 0) {
+        return 0;
+    }
+
+    return parsed > INT_MAX ? INT_MAX : (int) parsed;
+}
+
+static void ggml_metal_kprof_init_once(void) {
+    g_kprof.stride = ggml_metal_positive_env("GGML_METAL_KPROF");
+}
+
+int ggml_metal_kprof_stride(void) {
+    pthread_once(&g_kprof_once, ggml_metal_kprof_init_once);
     return g_kprof.stride;
 }
 
+static pthread_once_t g_kprof_debug_once = PTHREAD_ONCE_INIT;
+static bool g_kprof_debug = false;
+
+static void ggml_metal_kprof_debug_init_once(void) {
+    g_kprof_debug = ggml_metal_positive_env("GGML_METAL_KPROF_DEBUG") > 0;
+}
+
 static bool ggml_metal_kprof_debug(void) {
-    static bool init = false;
-    static bool on   = false;
-    if (!init) {
-        const char * v = getenv("GGML_METAL_KPROF_DEBUG");
-        on   = v && atoi(v) > 0;
-        init = true;
+    pthread_once(&g_kprof_debug_once, ggml_metal_kprof_debug_init_once);
+    return g_kprof_debug;
+}
+
+static uint64_t ggml_metal_kprof_hash(uint64_t h, const void * data, size_t size) {
+    const uint8_t * p = (const uint8_t *) data;
+    for (size_t i = 0; i < size; ++i) {
+        h = (h ^ p[i])*UINT64_C(1099511628211);
     }
-    return on;
+    return h;
+}
+
+uint64_t ggml_metal_kprof_graph_key(const struct ggml_cgraph * gf) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    h = ggml_metal_kprof_hash(h, &gf->n_nodes, sizeof(gf->n_nodes));
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const struct ggml_tensor * node = gf->nodes[i];
+        const char * op_desc = ggml_op_desc(node);
+        const size_t op_len  = strlen(op_desc);
+        const size_t name_len = strnlen(node->name, GGML_MAX_NAME);
+
+        h = ggml_metal_kprof_hash(h, &op_len, sizeof(op_len));
+        h = ggml_metal_kprof_hash(h, op_desc, op_len);
+        h = ggml_metal_kprof_hash(h, &node->type, sizeof(node->type));
+        h = ggml_metal_kprof_hash(h, node->ne, sizeof(node->ne));
+        h = ggml_metal_kprof_hash(h, &name_len, sizeof(name_len));
+        h = ggml_metal_kprof_hash(h, node->name, name_len);
+    }
+    return h;
 }
 
 static id<MTLCounterSampleBuffer> ggml_metal_kprof_new_sb(id<MTLDevice> dev) {
@@ -968,6 +1008,13 @@ struct ggml_metal_encoder {
     struct ggml_metal_kprof_batch * kprof;
 };
 
+void ggml_metal_encoder_kprof_set_graph(ggml_metal_encoder_t encoder, uint64_t uid, uint64_t key) {
+    if (encoder->kprof != NULL) {
+        encoder->kprof->uid = uid;
+        encoder->kprof->key = key;
+    }
+}
+
 // open a counter-sampled compute pass for the segment starting at `raw_node_idx`
 static void ggml_metal_encoder_kprof_begin(ggml_metal_encoder_t encoder, int raw_node_idx) {
     struct ggml_metal_kprof_batch * b = encoder->kprof;
@@ -979,6 +1026,8 @@ static void ggml_metal_encoder_kprof_begin(ggml_metal_encoder_t encoder, int raw
         id<MTLCounterSampleBuffer> sb = ggml_metal_kprof_acquire_sb([encoder->cmd_buf device]);
         if (sb) {
             b->sb[b->n_sb++] = sb;
+        } else {
+            b->cap = 0;
         }
     }
 
@@ -1037,10 +1086,21 @@ void ggml_metal_kprof_flush(void) {
     pthread_mutex_unlock(&g_kprof.mtx);
 
     int ibatch = 0;
+    int ndeferred = 0;
+    struct ggml_metal_kprof_batch * deferred = NULL;
 
     while (head != NULL) {
         struct ggml_metal_kprof_batch * b = head;
         head = b->next;
+
+        const MTLCommandBufferStatus status = [b->cmd_buf status];
+        if (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError) {
+            b->next = deferred;
+            deferred = b;
+            ndeferred++;
+            continue;
+        }
+
         const int batch = ibatch++;
 
         for (int isb = 0; isb < b->n_sb; ++isb) {
@@ -1072,20 +1132,25 @@ void ggml_metal_kprof_flush(void) {
                         }
 
                         if (error != NULL) {
-                            fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"seg\":%d,\"node\":%d,"
+                            fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"uid\":%llu,\"key\":%llu,"
+                                    "\"seg\":%d,\"node\":%d,"
                                     "\"error\":\"%s\",\"t0\":%llu,\"t1\":%llu}\n",
-                                    seq, batch, seg0 + i, b->nodes[seg0 + i], error,
+                                    seq, batch, (unsigned long long) b->uid, (unsigned long long) b->key,
+                                    seg0 + i, b->nodes[seg0 + i], error,
                                     (unsigned long long) t0, (unsigned long long) t1);
                             continue;
                         }
 
-                        fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"seg\":%d,\"node\":%d,\"t0\":%llu,\"ns\":%llu}\n",
-                                seq, batch, seg0 + i, b->nodes[seg0 + i],
+                        fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"uid\":%llu,\"key\":%llu,"
+                                "\"seg\":%d,\"node\":%d,\"t0\":%llu,\"ns\":%llu}\n",
+                                seq, batch, (unsigned long long) b->uid, (unsigned long long) b->key,
+                                seg0 + i, b->nodes[seg0 + i],
                                 (unsigned long long) t0, (unsigned long long) (t1 - t0));
                     }
                 } else {
-                    fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"error\":\"resolve failed\",\"sb\":%d,\"n_seg\":%d}\n",
-                            seq, batch, isb, nseg);
+                    fprintf(stderr, "KPROF {\"seq\":%d,\"b\":%d,\"uid\":%llu,\"key\":%llu,"
+                            "\"error\":\"resolve failed\",\"sb\":%d,\"n_seg\":%d}\n",
+                            seq, batch, (unsigned long long) b->uid, (unsigned long long) b->key, isb, nseg);
                 }
             }
 
@@ -1094,13 +1159,27 @@ void ggml_metal_kprof_flush(void) {
         }
 
         free(b->nodes);
+        [b->cmd_buf release];
         free(b);
+    }
+
+    if (deferred != NULL) {
+        pthread_mutex_lock(&g_kprof.mtx);
+        struct ggml_metal_kprof_batch * tail = deferred;
+        while (tail->next != NULL) {
+            tail = tail->next;
+        }
+        tail->next = g_kprof.pending;
+        g_kprof.pending = deferred;
+        pthread_mutex_unlock(&g_kprof.mtx);
     }
 
     if (ggml_metal_kprof_debug()) {
         pthread_mutex_lock(&g_kprof.mtx);
-        fprintf(stderr, "KPROFSB {\"seq\":%d,\"batches\":%d,\"created\":%d,\"reused\":%d,\"failed\":%d,\"free\":%d}\n",
-                seq, ibatch, g_kprof.n_created_sb, g_kprof.n_reused_sb, g_kprof.n_failed_sb, g_kprof.n_free_sb);
+        fprintf(stderr, "KPROFSB {\"seq\":%d,\"batches\":%d,\"deferred\":%d,\"created\":%d,"
+                "\"reused\":%d,\"failed\":%d,\"free\":%d}\n",
+                seq, ibatch, ndeferred, g_kprof.n_created_sb, g_kprof.n_reused_sb,
+                g_kprof.n_failed_sb, g_kprof.n_free_sb);
         pthread_mutex_unlock(&g_kprof.mtx);
     }
 }
@@ -1116,14 +1195,22 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     if (ggml_metal_kprof_stride() > 0) {
         // one batch per encoder; ownership passes to g_kprof.pending in encoder_free
         struct ggml_metal_kprof_batch * b = calloc(1, sizeof(struct ggml_metal_kprof_batch));
-        b->cap   = GGML_METAL_KPROF_MAX_SEGMENTS;
-        b->nodes = calloc(b->cap, sizeof(int));
-        res->kprof = b;
+        if (b != NULL) {
+            b->cap   = GGML_METAL_KPROF_MAX_SEGMENTS;
+            b->nodes = calloc(b->cap, sizeof(int));
+        }
 
-        // the first segment starts before any node is encoded; -1 marks that prologue
-        ggml_metal_encoder_kprof_begin(res, -1);
+        if (b != NULL && b->nodes != NULL) {
+            b->cmd_buf = [cmd_buf retain];
+            res->kprof = b;
 
-        return res;
+            // the first segment starts before any node is encoded; -1 marks that prologue
+            ggml_metal_encoder_kprof_begin(res, -1);
+
+            return res;
+        }
+
+        free(b);
     }
 
     if (concurrent) {
@@ -1150,6 +1237,7 @@ void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
             pthread_mutex_unlock(&g_kprof.mtx);
         } else {
             free(b->nodes);
+            [b->cmd_buf release];
             free(b);
         }
     }

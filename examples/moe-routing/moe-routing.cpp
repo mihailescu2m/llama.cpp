@@ -28,6 +28,7 @@ struct capture_data {
     uint32_t tag_mask = 0xf;   // MOE_ROUTING_TAGS bitmask; logits-only keeps a long prefill small
     int    step = 0;   // decode step; prompt is step 0, each generated token increments it
     int64_t n_rec = 0;
+    bool failed = false;
     std::vector<uint8_t> buf;
 };
 
@@ -86,8 +87,11 @@ static bool cb_capture(struct ggml_tensor * t, bool ask, void * user_data) {
     const int32_t hdr[8] = { (int32_t) tag, (int32_t) il, (int32_t) cd->step,
                              (int32_t) t->ne[0], (int32_t) t->ne[1], (int32_t) t->ne[2], (int32_t) t->ne[3],
                              (int32_t) nb };
-    fwrite(hdr, sizeof(hdr), 1, cd->out);
-    fwrite(cd->buf.data(), 1, nb, cd->out);
+    if (fwrite(hdr, sizeof(hdr), 1, cd->out) != 1 || fwrite(cd->buf.data(), 1, nb, cd->out) != nb) {
+        LOG_ERR("%s: failed to write routing record\n", __func__);
+        cd->failed = true;
+        return false;
+    }
     cd->n_rec++;
 
     return true;
@@ -164,8 +168,15 @@ int main(int argc, char ** argv) {
     // NOT greedy: this model falls into repetition attractors at temp 0, and repeated text would
     // make routing look far more predictable than it is
     common_sampler * smpl = common_sampler_init(model, params.sampling);
+    if (smpl == nullptr) {
+        LOG_ERR("%s: failed to initialize sampler\n", __func__);
+        fclose(cd.out);
+        llama_backend_free();
+        return 1;
+    }
 
     std::vector<llama_token> gen;
+    bool success = true;
     for (int i = 0; i < params.n_predict; i++) {
         cd.step = i + 1;
 
@@ -180,22 +191,29 @@ int main(int argc, char ** argv) {
 
         if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
             LOG_ERR("%s: decode failed at step %d\n", __func__, i);
+            success = false;
             break;
         }
     }
 
-    fclose(cd.out);
+    success = !cd.failed && fclose(cd.out) == 0 && success;
 
     // token ids alongside, so the offline pass can identify the hash-routed layers' inputs
     const std::string tok_path = out_path + ".tokens";
     if (FILE * ft = fopen(tok_path.c_str(), "wb")) {
         const int32_t n_prompt = (int32_t) inp.size();
-        fwrite(&n_prompt, sizeof(n_prompt), 1, ft);
-        fwrite(inp.data(), sizeof(llama_token), inp.size(), ft);
         const int32_t n_gen = (int32_t) gen.size();
-        fwrite(&n_gen, sizeof(n_gen), 1, ft);
-        fwrite(gen.data(), sizeof(llama_token), gen.size(), ft);
-        fclose(ft);
+        const bool wrote = fwrite(&n_prompt, sizeof(n_prompt), 1, ft) == 1 &&
+                           fwrite(inp.data(), sizeof(llama_token), inp.size(), ft) == inp.size() &&
+                           fwrite(&n_gen, sizeof(n_gen), 1, ft) == 1 &&
+                           fwrite(gen.data(), sizeof(llama_token), gen.size(), ft) == gen.size();
+        if (!wrote || fclose(ft) != 0) {
+            LOG_ERR("%s: failed to write %s\n", __func__, tok_path.c_str());
+            success = false;
+        }
+    } else {
+        LOG_ERR("%s: cannot open %s\n", __func__, tok_path.c_str());
+        success = false;
     }
 
     LOG_INF("%s: wrote %" PRId64 " records to %s (%d generated tokens)\n",
@@ -204,5 +222,5 @@ int main(int argc, char ** argv) {
     common_sampler_free(smpl);
     llama_backend_free();
 
-    return 0;
+    return success ? 0 : 1;
 }

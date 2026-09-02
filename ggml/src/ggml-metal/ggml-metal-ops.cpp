@@ -53,6 +53,8 @@ struct ggml_metal_op {
         this->kprof_stride    = ggml_metal_kprof_stride();
         this->kprof_count     = 0;
         this->gf              = gf;
+        this->kprof_key       = this->kprof_stride > 0 ? ggml_metal_kprof_graph_key(gf) : 0;
+        ggml_metal_encoder_kprof_set_graph(this->enc, gf->uid, this->kprof_key);
 
         idxs.reserve(gf->n_nodes);
 
@@ -111,6 +113,7 @@ struct ggml_metal_op {
 
     void encoder_start() {
         enc = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+        ggml_metal_encoder_kprof_set_graph(enc, gf->uid, kprof_key);
         ggml_mem_ranges_reset(mem_ranges);
     }
 
@@ -130,6 +133,7 @@ struct ggml_metal_op {
     // GGML_METAL_KPROF: split the encoder every `kprof_stride` non-noop nodes
     int kprof_stride = 0;
     int kprof_count  = 0;
+    uint64_t kprof_key = 0;
 
 private:
     ggml_cgraph * gf;
