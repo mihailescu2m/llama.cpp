@@ -9,8 +9,18 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
+
+static bool qwen4exp_indexer_f16() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_QWEN4EXP_INDEXER_F16");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 //
 // llama_memory_hybrid_idx
@@ -55,10 +65,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        // Quantization can change the discrete top-k block selection. Keep the raw index keys in
+        // f16 by default; the unused V side remains in the requested type to limit memory growth.
+        const ggml_type type_idx_k = qwen4exp_indexer_f16() ? GGML_TYPE_F16 : type_k;
+
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, K (%s), V (%s)\n",
+                __func__, kv_size, ggml_type_name(type_idx_k), ggml_type_name(type_v));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_idx_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
