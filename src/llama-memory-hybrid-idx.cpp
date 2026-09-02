@@ -535,6 +535,19 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
             if (cur_cell_blk != nullptr) {
                 cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+                continue;
+            }
+
+            // Block top-k has no cell_blk, so an unpooled cell cannot be routed to the spare block
+            // by per-cell lookup - it has to appear IN that block's member list or it drops out of
+            // the selection entirely, and the unpooled cells are the incomplete TAIL, i.e. the
+            // newest tokens. Place each at its own position slot, exactly as a full block does.
+            // One sequence has at most r-1 of them, so they never collide; several sequences in one
+            // stream can, and the last writer wins - which still beats what the arithmetic version
+            // did there, namely select unrelated cells.
+            if (have_dead && blk_of[j] < 0 && !cells.is_empty(j)) {
+                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+                cur_blk_cells[dead_bid*r + (idx%r)] = (int32_t) j;
             }
         }
 

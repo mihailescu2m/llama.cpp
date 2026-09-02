@@ -166,7 +166,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
-    // there is no output_norm: the final hyper-connection mixer carries it
+    // there is no output_norm: the final hyper-connection mixer carries it.
+    // tf, NOT 0: an mtp- sidecar carries only the NextN block plus embeddings, so these three are
+    // absent from it. Requiring them unconditionally makes every MTP draft fail to load with
+    // "tensor 'output_hc_norm.weight' not found", which takes speculation down with it.
     hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, tf);
     hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, tf);
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, tf);
@@ -1021,15 +1024,43 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor * blk_top = ggml_top_k(ctx0, score, n_blk_sel);
         cb(blk_top, "indexer_top_blk", il);
 
-        // Expand each selected block id to its r cache-cell ids.
-        ggml_tensor * base = ggml_scale(ctx0, ggml_cast(ctx0, blk_top, GGML_TYPE_F32), (float) r);
-        base = ggml_reshape_4d(ctx0, base, 1, n_blk_sel, n_tps, n_stream);
+        // Map each selected block to its r member cells THROUGH blk_cells.
+        //
+        // A block id is not a cell base. set_input_qsa hands out compacted block ids and records
+        // members as blk_cells[blk*r + k] = cell, so blk*r + k indexes that table, not the cell
+        // array - which is exactly what the header of llama-memory-hybrid-idx.h warns about
+        // ("blocks cut the position line, not the cell array"). The two coincide only when every
+        // live cell sits at its own position: one sequence, no holes, never shifted. They diverge
+        // after a context shift (seq_add reaches this cache), after a partial seq_rm leaves holes,
+        // with more than one sequence in a stream, and always on the ranked mrope ordering. The
+        // arithmetic version then unmasked the wrong cells and still produced fluent text.
+        //
+        // Gathering at BLOCK granularity keeps it cheap: rows of r ids, and no f32 detour - the
+        // previous expansion built an [r, n_blk_sel, n_tps, n_stream] f32 repeat just to add an
+        // arange to it.
+        // LLAMA_QSA_GATHER=0 restores the arithmetic (blk*r + k). It is WRONG whenever the cell
+        // map is not the identity - kept only so the two can be A/B'd on cost.
+        static const bool qsa_gather = [] {
+            const char * e = getenv("LLAMA_QSA_GATHER");
+            return !e || atoi(e) != 0;
+        }();
 
-        ggml_tensor * offset = ggml_arange(ctx0, 0.0f, (float) r, 1.0f);
-        offset = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, offset, r, 1, 1, 1),
-                r, n_blk_sel, n_tps, n_stream);
+        ggml_tensor * cells;
+        if (qsa_gather) {
+            ggml_tensor * tbl = ggml_reshape_3d(ctx0, inp->blk_cells, r, n_blocks, n_stream);
+            ggml_tensor * sel = ggml_reshape_3d(ctx0, blk_top, n_blk_sel*n_tps, n_stream, 1);
 
-        ggml_tensor * cells = ggml_cast(ctx0, ggml_add(ctx0, offset, base), GGML_TYPE_I32);
+            cells = ggml_get_rows(ctx0, tbl, sel);              // [r, n_blk_sel*n_tps, n_stream]
+        } else {
+            ggml_tensor * base = ggml_scale(ctx0, ggml_cast(ctx0, blk_top, GGML_TYPE_F32), (float) r);
+            base = ggml_reshape_4d(ctx0, base, 1, n_blk_sel, n_tps, n_stream);
+
+            ggml_tensor * offset = ggml_arange(ctx0, 0.0f, (float) r, 1.0f);
+            offset = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, offset, r, 1, 1, 1),
+                    r, n_blk_sel, n_tps, n_stream);
+
+            cells = ggml_cast(ctx0, ggml_add(ctx0, offset, base), GGML_TYPE_I32);
+        }
         cells = ggml_reshape_4d(ctx0, cells, r*n_blk_sel, n_tps, 1, n_stream);
         cb(cells, "indexer_top_k", il);
 
