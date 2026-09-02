@@ -2876,7 +2876,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
         ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
 
-    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+    threadgroup half2 * shmem_h2 = (threadgroup half2 *) shmem;
 
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
@@ -2899,7 +2899,13 @@ void kernel_mul_mv_mxfp4_f32_impl(
     const short ix = tiisg/2;  // 0...15
     const short it = tiisg%2;  // 0 or 1
 
-    shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
+    // Index the table by the whole BYTE rather than by each nibble: one load yields both the low
+    // and the high nibble's value, so 16 scalar lookups per iteration become 8 half2 lookups.
+    // half is exact here - every E2M1 value {0,.5,1,1.5,2,3,4,6} is representable - so this stays
+    // bit-identical to the f32 table.
+    for (short i = sgitg*32 + tiisg; i < 256; i += NSG*32) {
+        shmem_h2[i] = half2(kvalues_mxfp4_f[i & 0x0F], kvalues_mxfp4_f[i >> 4]);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float4 yl[4];
@@ -2921,10 +2927,19 @@ void kernel_mul_mv_mxfp4_f32_impl(
             device const block_mxfp4 & xb = x[row*ns01 + ib];
             device const uint8_t     * q2 = (device const uint8_t *)(xb.qs + 8*it);
 
-            float4 acc1 = yl[0]*float4(shmem_f32[q2[0] &  0x0F], shmem_f32[q2[1] &  0x0F], shmem_f32[q2[2] &  0x0F], shmem_f32[q2[3] &  0x0F]);
-            float4 acc2 = yl[1]*float4(shmem_f32[q2[0] >> 4   ], shmem_f32[q2[1] >> 4   ], shmem_f32[q2[2] >> 4   ], shmem_f32[q2[3] >> 4   ]);
-            float4 acc3 = yl[2]*float4(shmem_f32[q2[4] &  0x0F], shmem_f32[q2[5] &  0x0F], shmem_f32[q2[6] &  0x0F], shmem_f32[q2[7] &  0x0F]);
-            float4 acc4 = yl[3]*float4(shmem_f32[q2[4] >> 4   ], shmem_f32[q2[5] >> 4   ], shmem_f32[q2[6] >> 4   ], shmem_f32[q2[7] >> 4   ]);
+            const half2 b0 = shmem_h2[q2[0]];
+            const half2 b1 = shmem_h2[q2[1]];
+            const half2 b2 = shmem_h2[q2[2]];
+            const half2 b3 = shmem_h2[q2[3]];
+            const half2 b4 = shmem_h2[q2[4]];
+            const half2 b5 = shmem_h2[q2[5]];
+            const half2 b6 = shmem_h2[q2[6]];
+            const half2 b7 = shmem_h2[q2[7]];
+
+            float4 acc1 = yl[0]*float4(b0[0], b1[0], b2[0], b3[0]);
+            float4 acc2 = yl[1]*float4(b0[1], b1[1], b2[1], b3[1]);
+            float4 acc3 = yl[2]*float4(b4[0], b5[0], b6[0], b7[0]);
+            float4 acc4 = yl[3]*float4(b4[1], b5[1], b6[1], b7[1]);
 
             acc1 = (acc1 + acc3) + (acc2 + acc4);
 
