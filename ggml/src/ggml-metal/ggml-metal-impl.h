@@ -424,6 +424,9 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  n_dense;    // union-8: size of the contiguous dense prefix
+    int32_t  max_union;  // union-8: stride of a uids row (the length lives at [max_union])
+    uint64_t nbu1;       // union-8: uids row stride in bytes
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
@@ -567,6 +570,16 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mm_id;
+
+typedef struct {
+    int32_t  n_csa;
+    int32_t  n_sel;
+    int32_t  n_tokens;
+    int32_t  block;
+    int32_t  max_union;
+    uint64_t nbs1;
+    uint64_t nb1;
+} ggml_metal_kargs_union_build;
 
 typedef struct {
     int32_t  nei0;

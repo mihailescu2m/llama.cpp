@@ -755,6 +755,55 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
+
+    // Union-8 shares the selected CSA rows across blocks of eight queries while preserving each
+    // query's exact membership. The upstream sparse FA path remains the fallback outside this
+    // specialized DeepSeek MLA shape.
+    static const bool union_enabled = [] {
+        const char * env = getenv("LLAMA_DSV4_UNION");
+        return env == nullptr || std::string(env) != "0";
+    }();
+    static const int64_t union_min_ncsa = [] {
+        const char * env = getenv("LLAMA_DSV4_UNION_MIN_NCSA");
+        if (env == nullptr) {
+            return (int64_t) 4096;
+        }
+
+        char * end = nullptr;
+        const int64_t value = strtoll(env, &end, 10);
+        return end != env && *end == '\0' && value >= 0 ? value : (int64_t) 4096;
+    }();
+
+    const int64_t n_stream = csa_k->ne[3];
+    const int64_t n_raw    = raw_k->ne[2];
+
+    if (union_enabled && sinks == nullptr && n_stream == 1 && cparams.flash_attn &&
+        top_k->ne[0] < n_csa && n_tokens >= 8 && (n_raw % 64) == 0 &&
+        n_csa >= union_min_ncsa && n_csa <= 65536) {
+        ggml_tensor * uids = ggml_union_build(ctx0, top_k, n_csa, 8);
+        cb(uids, "csa_uids", il);
+
+        ggml_tensor * qq = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        qq = ggml_permute(ctx0, qq, 0, 2, 1, 3);
+
+        ggml_tensor * kk = ggml_permute(ctx0, k_all, 0, 2, 1, 3);
+        if (kk->type == GGML_TYPE_F32) {
+            kk = ggml_cast(ctx0, kk, GGML_TYPE_F16);
+        }
+
+        ggml_tensor * out = ggml_flash_attn_union(
+                ctx0, qq, kk, kk, raw_mask, uids, (int) n_raw, kq_scale);
+        out = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
+
+        if (k_rot) {
+            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        }
+        cb(out, "attn_csa_lid", il);
+
+        return out;
+    }
+
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);

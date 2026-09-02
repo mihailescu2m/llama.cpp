@@ -2216,6 +2216,34 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_FLASH_ATTN_UNION: {
+            const struct ggml_tensor * q    = op->src[0];
+            const struct ggml_tensor * k    = op->src[1];
+            const struct ggml_tensor * v    = op->src[2];
+            const struct ggml_tensor * mask = op->src[3];
+            const struct ggml_tensor * uids = op->src[4];
+            const int32_t n_dense = ggml_get_op_params_i32(op, 1);
+
+            return q && k && v && mask && uids &&
+                   q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
+                   v->type == GGML_TYPE_F16 && mask->type == GGML_TYPE_F16 &&
+                   uids->type == GGML_TYPE_I32 &&
+                   q->ne[0] == 512 && k->ne[0] == 512 && v->ne[0] == 512 &&
+                   q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+                   k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] &&
+                   k->ne[2] > 0 && q->ne[2] % k->ne[2] == 0 &&
+                   n_dense >= 0 && n_dense % 64 == 0 && mask->ne[0] >= MAX(n_dense, 1) &&
+                   mask->ne[1] == q->ne[1] && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+                   q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) &&
+                   v->nb[0] == sizeof(ggml_fp16_t) && mask->nb[0] == sizeof(ggml_fp16_t) &&
+                   uids->nb[0] == sizeof(int32_t);
+        }
+        case GGML_OP_UNION_BUILD:
+            // The bitmap and prefix table use 16 KB at 65536 rows.
+            return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                   ggml_get_op_params_i32(op, 0) > 0 && ggml_get_op_params_i32(op, 0) <= 65536 &&
+                   ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 1) <= 8;
         case GGML_OP_FLASH_ATTN_EXT:
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&

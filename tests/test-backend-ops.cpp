@@ -7310,6 +7310,119 @@ struct test_leaky_relu : public test_case {
     }
 };
 
+// GGML_OP_UNION_BUILD
+struct test_union_build : public test_case {
+    const int64_t n_sel;
+    const int64_t n_tokens;
+    const int64_t n_csa;
+    const int64_t block;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_sel, n_tokens, n_csa, block);
+    }
+
+    test_union_build(int64_t n_sel = 128, int64_t n_tokens = 64, int64_t n_csa = 4096, int64_t block = 8)
+        : n_sel(n_sel), n_tokens(n_tokens), n_csa(n_csa), block(block) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, n_tokens);
+        ggml_set_name(sel, "sel");
+
+        ggml_tensor * out = ggml_union_build(ctx, sel, n_csa, block);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(0x554e494f);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                continue;
+            }
+
+            std::vector<int32_t> data(n_sel*n_tokens);
+            std::vector<int32_t> pool(n_csa);
+            std::iota(pool.begin(), pool.end(), 0);
+
+            for (int64_t row = 0; row < n_tokens; ++row) {
+                std::shuffle(pool.begin(), pool.end(), rng);
+                std::copy_n(pool.begin(), n_sel, data.begin() + row*n_sel);
+            }
+
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+
+    double max_nmse_err() override { return 0.0; }
+};
+
+// GGML_OP_FLASH_ATTN_UNION
+struct test_flash_attn_union : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t nr2;
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t n_sel;
+    const int64_t n_dense;
+    const bool uniform;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, nh, nr2, kv, nb, n_sel, n_dense, uniform);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_flash_attn_union(int64_t hs = 512, int64_t nh = 1, int64_t nr2 = 64, int64_t kv = 2048,
+                          int64_t nb = 64, int64_t n_sel = 128, int64_t n_dense = 0, bool uniform = false)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), n_sel(n_sel), n_dense(n_dense), uniform(uniform) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr2, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, nb);
+        ggml_set_name(sel, "sel");
+        ggml_tensor * uids = ggml_union_build(ctx, sel, kv - n_dense, 8);
+        ggml_set_name(uids, "uids");
+
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, std::max<int64_t>(n_dense, 1), nb, 1, 1);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_flash_attn_union(ctx, q, k, v, mask, uids, n_dense, 1.0f/sqrtf(hs));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(0x554e494f);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(n_sel*nb);
+                const int64_t n_csa = kv - n_dense;
+                std::vector<int32_t> pool(n_csa);
+                std::iota(pool.begin(), pool.end(), 0);
+
+                for (int64_t row = 0; row < nb; ++row) {
+                    if (!uniform || row % 8 == 0) {
+                        std::shuffle(pool.begin(), pool.end(), rng);
+                    }
+                    std::copy_n(pool.begin(), n_sel, data.begin() + row*n_sel);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
@@ -9627,6 +9740,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 512, 8, 512, 0));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 1024, 64, 64, 0, true));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 1024, 64, 64, 128));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 1024, 65, 64, 128));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1, 64, 2048, 64, 128, 256));
+    test_cases.emplace_back(new test_flash_attn_union(512, 2, 24, 1024, 64, 64, 0));
+    test_cases.emplace_back(new test_flash_attn_union(512, 2,  1, 1024, 64, 64, 0));
+    test_cases.emplace_back(new test_flash_attn_union(512, 4,  1, 1024, 64, 64, 0));
+    test_cases.emplace_back(new test_flash_attn_union(512, 1,  2, 1024, 64, 64, 0));
+    test_cases.emplace_back(new test_flash_attn_union(512, 2,  2, 1024, 64, 64, 0));
+    test_cases.emplace_back(new test_flash_attn_union(512, 4,  4, 1024, 64, 64, 0));
+
+    for (int64_t n_csa : {1024, 4096, 32768}) {
+        for (int64_t block : {4, 8}) {
+            test_cases.emplace_back(new test_union_build(128, 65, n_csa, block));
+        }
+    }
 
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
