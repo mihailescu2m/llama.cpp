@@ -8,7 +8,9 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    // get_host_ptr extends the by-value buffer interface and shifts ggml_backend_buffer fields.
+    // Backends compiled against the old layout must not pass the dynamic loader's ABI check.
+    #define GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
@@ -64,6 +66,11 @@ extern "C" {
         void         (*clear)        (ggml_backend_buffer_t buffer, uint8_t value);
         // (optional) reset any internal state due to tensor initialization, such as tensor extras
         void         (*reset)        (ggml_backend_buffer_t buffer);
+        // (optional) host-addressable base of the buffer, or NULL when the memory cannot be written
+        // directly by the CPU. Distinct from buft.is_host, which says whether the CPU BACKEND may run
+        // ops here - Metal reports false there to keep ops on the GPU while its shared buffers are
+        // still plain host memory. Backends that hand out synthetic addresses must leave this NULL.
+        void *       (*get_host_ptr) (ggml_backend_buffer_t buffer);
     };
 
     struct ggml_backend_buffer {
