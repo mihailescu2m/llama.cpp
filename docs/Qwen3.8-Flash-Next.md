@@ -197,6 +197,27 @@ file offset. Upstream's lazy path remains the fallback.
 Deliberately **buffered, not `O_DIRECT`** — at 90 bytes a row the page cache genuinely helps, which
 is the opposite of the finding for multi-MiB expert slabs.
 
+#### Ubatch sizing when the experts are resident
+
+A data point from the other side of that trade, on an M1 Max 64 GB running AtomicChat's
+`AD-3.84bpw-IQ4_XS-M64` with the experts fully resident (no `--moe-stream`). Prefill peaks at
+`-ub 1024`, not 4096:
+
+| ubatch | prefill | wired | page cache |
+|---:|---:|---:|---:|
+| 512 | 139.4 tok/s | 49.60 GiB | 4.54 GiB |
+| 1024 | **173.6 tok/s** | 50.52 GiB | 4.53 GiB |
+| 2048 | 170.9 tok/s | 52.12 GiB | 2.87 GiB |
+| 4096 | 149.4 tok/s | 55.04 GiB | 1.64 GiB |
+
+Without a streaming budget bounding the experts, a larger ubatch takes its compute buffer out of
+the page cache — the same cache the 90-byte PLE rows are read through. At 4096 it fell to
+1.64 GiB and swap reached 6.5 GB, and the I/O cost outweighed the compute gain.
+
+Method: one ~11.6k-token uncached prompt per configuration, `prompt_seconds_total` delta from
+`/metrics`, server restarted between runs, `-c 131072 -fa on`, q8_0 KV. Single run each on one
+machine, so indicative rather than rigorous.
+
 ### Correctness fixes
 
 | Fix | Consequence if missing |
