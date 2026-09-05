@@ -10731,6 +10731,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Non-padded query masks ending inside a Metal query tile. The mask-block scan must
+    // mark the final tile partial instead of reading a full Q rows beyond the allocation.
+    for (int64_t nb : {17, 33, 65}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, nb));
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
