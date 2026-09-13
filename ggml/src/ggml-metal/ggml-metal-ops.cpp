@@ -12,6 +12,7 @@
 
 #include <cassert>
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <cmath>
 
@@ -715,7 +716,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
         // TODO: make a simpler cpy_bytes kernel
 
         //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
 
         ggml_metal_kargs_cpy args = {
             /*.nk0  =*/ ne00,
@@ -2101,7 +2102,7 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
         // TODO: make a simpler cpy_bytes kernel
 
         //const id<MTLComputePipelineState> pipeline = ctx->pipelines[GGML_METAL_PIPELINE_TYPE_CPY_F32_F32].obj;
-        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+        auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
 
         ggml_metal_kargs_cpy args = {
             /*.nk0  =*/ ne00,
@@ -2135,7 +2136,7 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type);
+    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type, false);
 
     GGML_ASSERT(ne10 % ggml_blck_size(op->src[1]->type) == 0);
 
@@ -2205,12 +2206,41 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
+    const ggml_tensor * src = op->src[0];
+    if (op->op == GGML_OP_CPY && src->type == op->type && ggml_is_contiguous(src) && ggml_is_contiguous(op)) {
+        const size_t nbytes = ggml_nbytes(src);
+        const auto bid_src = ggml_metal_get_buffer_id(src);
+        const auto bid_dst = ggml_metal_get_buffer_id(op);
+        const uintptr_t src_addr = (uintptr_t) src->data;
+        const uintptr_t dst_addr = (uintptr_t) op->data;
+        const uintptr_t addr_distance = src_addr < dst_addr ? dst_addr - src_addr : src_addr - dst_addr;
+        const size_t offs_distance = bid_src.offs < bid_dst.offs ? bid_dst.offs - bid_src.offs : bid_src.offs - bid_dst.offs;
+
+        // Different Metal buffer objects can map overlapping host memory.
+        const bool disjoint = addr_distance >= nbytes && (bid_src.metal != bid_dst.metal || offs_distance >= nbytes);
+        const bool aligned = ((src_addr | dst_addr | bid_src.offs | bid_dst.offs | nbytes) & 15) == 0;
+
+        if (disjoint && aligned && nbytes > 0 && nbytes == ggml_nbytes(op) && nbytes/16 <= std::numeric_limits<uint32_t>::max()) {
+            auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, src->type, op->type, true);
+            uint32_t n = nbytes/16;
+            const int nth = std::min<int>(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &n, sizeof(n), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ((uint64_t) n + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+            return 1;
+        }
+    }
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
 
     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);
 
