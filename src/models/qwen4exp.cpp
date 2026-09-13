@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-attention-union.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
@@ -1200,6 +1201,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     return top_k;
 }
 
+// QSA gathered prefill (LLAMA_QSA_GATHER=1 turns it on) from this many KV cells up
+static int64_t qwen4exp_qsa_gather_min_kv() {
+    static const int64_t v = [] {
+        const char * e = getenv("LLAMA_QSA_GATHER");
+        if (!e || atoi(e) == 0) {
+            return INT64_MAX;
+        }
+        const char * m = getenv("LLAMA_QSA_GATHER_MIN_KV");
+        return m ? (int64_t) atoll(m) : (int64_t) 8192;
+    }();
+    return v;
+}
+
 // Dense GQA self-attention restricted to the cells that top_k names.
 // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
@@ -1240,6 +1254,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    // gathered prefill (LLAMA_QSA_GATHER=1, off by default): FA reads only the cells top_k names, 8
+    // queries sharing the union of their selections; the causal mask still applies to every cell. The
+    // same attention in exact arithmetic, but NOT bit-identical to the masked dense FA below: the sums
+    // run over the cells in a different order.
+    {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+        const int64_t n_kv_cur = k->ne[2];
+        const bool    gather   = n_kv_cur >= qwen4exp_qsa_gather_min_kv() && cparams.flash_attn && n_tokens > 32 &&
+                k->ne[3] == 1 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && v->nb[1] <= v->nb[2] &&
+                (k->ne[0] == 256 || k->ne[0] == 512) && v->ne[0] == k->ne[0] && q_cur->ne[0] == k->ne[0] &&
+                hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+                top_k->ne[0] <= n_kv_cur && n_kv_cur <= (1 << 24) && kq_mask->ne[0] == n_kv_cur;
+
+        if (gather) {
+            ggml_tensor * sel  = ggml_reshape_2d(ctx0, top_k, top_k->ne[0], top_k->ne[1]*top_k->ne[2]*top_k->ne[3]);
+            ggml_tensor * uids = ggml_union_build(ctx0, sel, (int) n_kv_cur, 8);
+            cb(uids, "qsa_uids", il);
+
+            // [D, n_head, n_tokens] -> [D, n_tokens, n_head]; K/V [D, n_head_kv, n_kv] -> [D, n_kv, n_head_kv]
+            ggml_tensor * qq = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+            ggml_tensor * kk = ggml_permute(ctx0, k, 0, 2, 1, 3);
+            ggml_tensor * vv = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+            ggml_tensor * cur = llama_attention_union_masked(ctx0, qq, kk, vv, kq_mask, uids, 0, kq_scale);
+            if (llama_attention_union_supported(model.dev_layer(il), uids, cur)) {
+                cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+                cb(cur, "kqv_out", il);
+
+                if (inp->self_v_rot) {
+                    cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+                }
+
+                return cur;
+            }
+        }
+    }
 
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
