@@ -1677,6 +1677,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--ubatch-size-decode"}, "N",
+        "physical maximum batch size used after prompt processing (0 = disabled; single-slot server only)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("decode physical batch size must be non-negative");
+            }
+            params.n_ubatch_decode = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_DECODE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-decode-max"}, "N",
+        string_format("with --ubatch-size-decode, process uncached prompt tails of up to N tokens at the decode "
+                      "ubatch instead of switching workspaces and migrating the expert cache (0 = always switch; default: %d)",
+                      params.n_prompt_decode_max),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt decode limit must be non-negative");
+            }
+            params.n_prompt_decode_max = value;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_DECODE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
@@ -2794,7 +2816,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-stream-cache"}, "<NG|Ns>",
         "expert cache for --moe-stream: memory budget in GiB (e.g. 40) or exact slots per layer with an 's' suffix (e.g. 64s); implies --moe-stream (default: auto)",
         [](common_params & params, const std::string & value) {
-            params.moe_stream = true;
+            if (value.empty() || !std::isdigit(static_cast<unsigned char>(value.front()))) {
+                throw std::invalid_argument("expert cache must be a non-negative size");
+            }
             size_t pos = 0;
             const uint64_t n = std::stoull(value, &pos);
             std::string suffix = value.substr(pos);
@@ -2802,14 +2826,63 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 c = std::tolower(c);
             }
             if (suffix == "s" || suffix == "slot" || suffix == "slots") {
-                params.moe_stream_slots = n;
+                if (n >= UINT32_MAX) {
+                    throw std::invalid_argument("expert slot count is too large");
+                }
+                params.moe_stream_slots = (uint32_t) n;
+                params.moe_stream_budget = 0;
             } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                if (n > UINT64_MAX / (1024ull * 1024ull * 1024ull)) {
+                    throw std::invalid_argument("expert cache budget is too large");
+                }
                 params.moe_stream_budget = n * 1024ull * 1024ull * 1024ull;
+                params.moe_stream_slots = 0;
             } else {
                 throw std::invalid_argument("invalid value");
             }
+            params.moe_stream = true;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
+    add_opt(common_arg(
+        {"--moe-stream-cache-decode"}, "<auto|NG|Ns|0>",
+        "decode expert cache: auto (default) uses reclaimed workspace RAM with migration headroom; GiB or slots set an explicit size; 0 keeps the cache fixed. Requires --ubatch-size-decode and --parallel 1",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_stream_decode_auto = true;
+                params.moe_stream_slots_decode = 0;
+                params.moe_stream_budget_decode = 0;
+                return;
+            }
+            if (value.empty() || !std::isdigit(static_cast<unsigned char>(value.front()))) {
+                throw std::invalid_argument("decode expert cache must be auto or a non-negative size");
+            }
+            size_t pos = 0;
+            const uint64_t n = std::stoull(value, &pos);
+            std::string suffix = value.substr(pos);
+            for (auto & c : suffix) {
+                c = std::tolower(c);
+            }
+            if (suffix == "s" || suffix == "slot" || suffix == "slots") {
+                if (n >= UINT32_MAX) {
+                    throw std::invalid_argument("decode expert slot count is too large");
+                }
+                params.moe_stream_slots_decode  = (uint32_t) n;
+                params.moe_stream_budget_decode = 0;
+            } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                if (n > UINT64_MAX / (1024ull * 1024ull * 1024ull)) {
+                    throw std::invalid_argument("decode expert cache budget is too large");
+                }
+                params.moe_stream_budget_decode = n * 1024ull * 1024ull * 1024ull;
+                params.moe_stream_slots_decode  = 0;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_decode_auto = false;
+            if (n > 0) {
+                params.moe_stream = true;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_CACHE_DECODE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--moe-stream-io-threads"}, "N",
         "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",

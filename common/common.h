@@ -450,6 +450,8 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    int32_t n_ubatch_decode       =     0; // decode-only physical batch size (0 = fixed n_ubatch)
+    int32_t n_prompt_decode_max   =   400; // uncached prompt tails up to this stay in the decode phase (0 = always switch)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -585,6 +587,9 @@ struct common_params {
     bool     moe_stream            = false; // stream MoE routed expert weights from disk on demand
     uint32_t moe_stream_slots      = 0;     // expert cache slots per streamed layer (0 = auto)
     uint64_t moe_stream_budget     = 0;     // total expert cache byte budget, used when slots == 0 (0 = auto)
+    uint32_t moe_stream_slots_decode  = 0;  // decode-phase slots per layer (0 = use budget or fixed cache)
+    uint64_t moe_stream_budget_decode = 0;  // explicit decode-phase expert cache byte budget (0 = unset)
+    bool     moe_stream_decode_auto = true; // use reclaimed workspace RAM when phase switching is enabled
     int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
     bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
 

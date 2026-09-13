@@ -56,6 +56,25 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // Drop the current compute scheduler and select the physical microbatch capacity used by the
+    // next reservation. Persistent model memory, KV/recurrent state and output buffers are not
+    // touched. The caller must establish a phase boundary before using this.
+    bool phase_prepare(uint32_t n_ubatch);
+    bool phase_capacity_valid(uint32_t n_ubatch) const;
+
+    // The auto cache budget depends only on the two workspace capacities and the prefill state it
+    // starts from, and every transition measured it identically. The first measurement is reused;
+    // the post-resize memory check still runs, and a failed transition forgets it.
+    struct phase_budget_memo {
+        bool                  valid        = false;
+        const llama_context * dft          = nullptr;
+        uint32_t              ubatch_tgt   = 0;
+        uint32_t              ubatch_dft   = 0;
+        uint32_t              slots_from   = 0;
+        uint64_t              compute_from = 0;
+        uint32_t              slots        = 0;
+    } phase_budget;
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -283,6 +302,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    uint32_t phase_ubatch_max = 0; // persistent caches were constructed for this capacity
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

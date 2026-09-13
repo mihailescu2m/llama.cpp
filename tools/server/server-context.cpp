@@ -888,6 +888,16 @@ private:
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
+    bool     memory_phase_enabled       = false;
+    bool     memory_phase_decode        = false;
+    uint32_t memory_phase_ubatch_prefill_tgt = 0;
+    uint32_t memory_phase_ubatch_prefill_dft = 0;
+    uint32_t memory_phase_ubatch_decode_tgt  = 0;
+    uint32_t memory_phase_ubatch_decode_dft  = 0;
+    uint32_t memory_phase_cache_prefill = 0;
+    uint32_t memory_phase_cache_decode  = 0;
+    bool     memory_phase_cache_decode_measured = false;
+
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -949,6 +959,43 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+    }
+
+    void set_memory_phase(bool decode) {
+        if (!memory_phase_enabled || memory_phase_decode == decode) {
+            return;
+        }
+
+        uint32_t ubatch_tgt = decode ? memory_phase_ubatch_decode_tgt : memory_phase_ubatch_prefill_tgt;
+        uint32_t ubatch_dft = decode ? memory_phase_ubatch_decode_dft : memory_phase_ubatch_prefill_dft;
+        uint32_t cache      = decode ? memory_phase_cache_decode : memory_phase_cache_prefill;
+
+        if (decode) {
+            const bool auto_cache = params_base.moe_stream_decode_auto && memory_phase_cache_prefill > 0;
+            if (auto_cache && !memory_phase_cache_decode_measured) {
+                cache = UINT32_MAX;
+            }
+            // afterwards the first measured decode size is reused: growing from a partial prefill
+            // cache through the auto budget would apply its margins a second time
+        }
+
+        bool ok = false;
+        queue_tasks.yield_to_queue([&]() {
+            ok = llama_memory_phase_transition(ctx_tgt, ctx_dft, ubatch_tgt, ubatch_dft, cache);
+        });
+        if (!ok) {
+            throw std::runtime_error(decode ? "failed to enter decode memory phase"
+                                            : "failed to enter prefill memory phase");
+        }
+
+        memory_phase_decode = decode;
+        if (decode && !memory_phase_cache_decode_measured) {
+            memory_phase_cache_decode = llama_moe_stream_cache_slots(model_tgt);
+            memory_phase_cache_decode_measured = params_base.moe_stream_decode_auto && memory_phase_cache_prefill > 0;
+        }
+        SRV_INF("memory phase = %s: target ubatch %u, draft ubatch %u, expert cache %u slots\n",
+                decode ? "decode" : "prefill", ubatch_tgt, ctx_dft ? ubatch_dft : 0,
+                llama_moe_stream_cache_slots(model_tgt));
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1277,6 +1324,75 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        memory_phase_enabled = params_base.n_ubatch_decode > 0;
+        memory_phase_decode  = false;
+        if ((params_base.moe_stream_slots_decode > 0 || params_base.moe_stream_budget_decode > 0) &&
+                !memory_phase_enabled) {
+            SRV_ERR("%s", "--moe-stream-cache-decode requires --ubatch-size-decode\n");
+            return false;
+        }
+        if (memory_phase_enabled) {
+            if (params_base.n_parallel != 1) {
+                SRV_ERR("%s", "phase-aware ubatch/cache resizing currently requires --parallel 1\n");
+                return false;
+            }
+
+            memory_phase_ubatch_prefill_tgt = llama_n_ubatch(ctx_tgt);
+            memory_phase_ubatch_prefill_dft = ctx_dft ? llama_n_ubatch(ctx_dft) : 0;
+            memory_phase_ubatch_decode_tgt  = (uint32_t) params_base.n_ubatch_decode;
+            memory_phase_ubatch_decode_dft  = ctx_dft ? std::min<uint32_t>(
+                    memory_phase_ubatch_prefill_dft, memory_phase_ubatch_decode_tgt) : 0;
+            memory_phase_cache_prefill = llama_moe_stream_cache_slots(model_tgt);
+            memory_phase_cache_decode  = memory_phase_cache_prefill;
+            memory_phase_cache_decode_measured = false;
+
+            const uint32_t n_draft = (uint32_t) std::max(0, common_speculative_n_max(&params_base.speculative));
+            // Checkpoint replay may evaluate the accepted replacement as well as the anchor.
+            const uint32_t n_verify = n_draft > 0 ? n_draft + 2 : 1;
+            const uint32_t n_rollback_tgt = llama_n_rs_seq(ctx_tgt) > 0 ? llama_n_rs_seq(ctx_tgt) + 2 : 1;
+            const uint32_t n_rollback_dft = ctx_dft && llama_n_rs_seq(ctx_dft) > 0 ? llama_n_rs_seq(ctx_dft) + 2 : 1;
+            const uint32_t n_min_tgt = std::max(n_verify, n_rollback_tgt);
+            const uint32_t n_min_dft = std::max(n_verify, n_rollback_dft);
+
+            if (memory_phase_ubatch_decode_tgt < n_min_tgt ||
+                    memory_phase_ubatch_decode_tgt > memory_phase_ubatch_prefill_tgt ||
+                    (ctx_dft && memory_phase_ubatch_decode_dft < n_min_dft)) {
+                SRV_ERR("decode ubatch %u is incompatible (target needs >= %u and <= %u; draft needs >= %u)\n",
+                        memory_phase_ubatch_decode_tgt, n_min_tgt,
+                        memory_phase_ubatch_prefill_tgt, ctx_dft ? n_min_dft : 0);
+                return false;
+            }
+
+            if (params_base.moe_stream_slots_decode > 0) {
+                memory_phase_cache_decode = params_base.moe_stream_slots_decode;
+            } else if (params_base.moe_stream_budget_decode > 0) {
+                memory_phase_cache_decode = llama_moe_stream_slots_for_budget(
+                        model_tgt, params_base.moe_stream_budget_decode,
+                        std::max<uint32_t>(1, memory_phase_cache_prefill));
+            }
+
+            if ((params_base.moe_stream_slots_decode > 0 || params_base.moe_stream_budget_decode > 0) &&
+                    memory_phase_cache_prefill == 0) {
+                SRV_ERR("%s", "--moe-stream-cache-decode requires an active streamed expert cache\n");
+                return false;
+            }
+            if (memory_phase_cache_decode > 0 && memory_phase_cache_decode < memory_phase_cache_prefill) {
+                SRV_ERR("decode expert cache %u slots is smaller than the prefill cache %u slots\n",
+                        memory_phase_cache_decode, memory_phase_cache_prefill);
+                return false;
+            }
+
+            SRV_INF("phase-aware memory enabled: prefill ubatch target/draft %u/%u, decode %u/%u; expert cache %u -> %u slots\n",
+                    memory_phase_ubatch_prefill_tgt, memory_phase_ubatch_prefill_dft,
+                    memory_phase_ubatch_decode_tgt, memory_phase_ubatch_decode_dft,
+                    memory_phase_cache_prefill, memory_phase_cache_decode);
+            if (params_base.moe_stream_decode_auto && memory_phase_cache_prefill > 0) {
+                SRV_INF("%s", "decode cache policy: auto; final slot count is measured at the prompt boundary\n");
+            } else if (memory_phase_cache_decode == memory_phase_cache_prefill) {
+                SRV_INF("%s", "decode cache policy: fixed; reclaimed workspace RAM will not add expert slots\n");
+            }
         }
 
         if (!spec && params_base.speculative.has_synth()) {
@@ -3413,6 +3529,32 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // Leave the decode workspace only for a prompt tail that pays for the round trip.
+                        // Each direction rebuilds both schedulers and migrates the retained experts, and
+                        // most agentic turns append a short tool result. The tail is known only here,
+                        // after prefix reuse and checkpoint restores - a restore can roll back further than
+                        // the common prefix suggests. A short tail runs at the decode ubatch instead.
+                        if (memory_phase_enabled && memory_phase_decode) {
+                            const int n_tail = slot.task->n_tokens() - n_past;
+                            if (n_tail > params_base.n_prompt_decode_max) {
+                                try {
+                                    set_memory_phase(false);
+                                } catch (const std::exception & e) {
+                                    SRV_ERR("memory phase transition failed: %s\n", e.what());
+                                    abort_all_slots("memory phase transition failed: " + std::string(e.what()));
+                                    return;
+                                }
+                                // n_ubatch was read in the decode phase; the checkpoint offsets and
+                                // near_prompt_end below must see the prefill ubatch, or the tail is
+                                // cut one decode ubatch before its end and splits differently than
+                                // without phase switching
+                                n_ubatch = llama_n_ubatch(ctx_tgt);
+                            } else {
+                                SLT_INF(slot, "memory phase: %d-token prompt tail stays in decode (limit %d)\n",
+                                        n_tail, params_base.n_prompt_decode_max);
+                            }
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -3793,6 +3935,25 @@ private:
                     slot.copy_state_to(*child);
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }
+            }
+        }
+
+        if (memory_phase_enabled && !memory_phase_decode) {
+            bool completed_sampling_prompt = false;
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                if (!batch.tokens[off + i].is_prompt) {
+                    continue;
+                }
+                const llama_seq_id seq_id = batch_view.seq_id[i][0];
+                if (seq_id >= 0 && seq_id < (llama_seq_id) slots.size()) {
+                    const auto & slot = slots[seq_id];
+                    completed_sampling_prompt |= slot.state == SLOT_STATE_DONE_PROMPT &&
+                            slot.task && slot.task->need_sampling() &&
+                            slot.i_batch >= off && slot.i_batch < off + batch_view.n_tokens;
+                }
+            }
+            if (completed_sampling_prompt) {
+                set_memory_phase(true);
             }
         }
 

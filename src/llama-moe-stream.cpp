@@ -1231,6 +1231,7 @@ static bool moe_stream_resize_layer_inplace(llama_moe_stream & mgr, llama_moe_st
     std::vector<int32_t>  slot_expert(new_slots, -1);
     std::vector<uint8_t>  slot_state(new_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
     std::vector<uint8_t>  slot_pending(new_slots, 0);
+    std::vector<uint8_t>  slot_spec(new_slots, 0);
     std::vector<uint64_t> slot_gen(new_slots, 1);
     std::vector<int64_t>  slot_last_use(new_slots, 0);
     std::vector<uint8_t>  keep(new_slots, 0);
@@ -1320,7 +1321,7 @@ static bool moe_stream_resize_layer_inplace(llama_moe_stream & mgr, llama_moe_st
     sl.slot_pending  = std::move(slot_pending);
     sl.slot_gen      = std::move(slot_gen);
     sl.slot_last_use = std::move(slot_last_use);
-    sl.slot_spec     .assign(new_slots, 0); // observability only: a resize drops pending marks
+    sl.slot_spec     = std::move(slot_spec); // a resize drops pending marks; publication must not allocate
     sl.expert_slot   = std::move(expert_slot);
     sl.keep = std::move(keep);
     sl.demand_slots.clear();
@@ -1343,6 +1344,7 @@ static bool moe_stream_resize_layer(
     std::vector<int32_t>  slot_expert(new_slots, -1);
     std::vector<uint8_t>  slot_state(new_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
     std::vector<uint8_t>  slot_pending(new_slots, 0);
+    std::vector<uint8_t>  slot_spec(new_slots, 0);
     std::vector<uint64_t> slot_gen(new_slots, 1);
     std::vector<int64_t>  slot_last_use(new_slots, 0);
     std::vector<uint8_t>  keep(new_slots, 0);
@@ -1492,7 +1494,7 @@ static bool moe_stream_resize_layer(
     sl.slot_pending  = std::move(slot_pending);
     sl.slot_gen      = std::move(slot_gen);
     sl.slot_last_use = std::move(slot_last_use);
-    sl.slot_spec     .assign(new_slots, 0); // observability only: a resize drops pending marks
+    sl.slot_spec     = std::move(slot_spec); // a resize drops pending marks; publication must not allocate
     sl.expert_slot   = std::move(expert_slot);
     sl.keep = std::move(keep);
     sl.demand_slots.clear();

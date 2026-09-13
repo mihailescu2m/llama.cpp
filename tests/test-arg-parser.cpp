@@ -17,6 +17,25 @@
 static void test(void) {
     common_params params;
 
+    // Cache sizes must not wrap, and switching units must replace the previous setting.
+    for (const char * option : {"--moe-stream-cache", "--moe-stream-cache-decode"}) {
+        for (const char * value : {"-1", " -1", "4294967296s", "17179869184G"}) {
+            common_params cache_params;
+            const char * argv[] = {"test", option, value};
+            assert(!common_params_parse(3, const_cast<char **>(argv), cache_params, LLAMA_EXAMPLE_SERVER));
+        }
+        common_params cache_params;
+        const char * argv[] = {"test", option, "64s", option, "28G"};
+        assert(common_params_parse(5, const_cast<char **>(argv), cache_params, LLAMA_EXAMPLE_SERVER));
+        const bool decode = std::string(option) == "--moe-stream-cache-decode";
+        assert((decode ? cache_params.moe_stream_slots_decode : cache_params.moe_stream_slots) == 0);
+        assert((decode ? cache_params.moe_stream_budget_decode : cache_params.moe_stream_budget) == (28ull << 30));
+        const char * reverse[] = {"test", option, "28G", option, "64s"};
+        assert(common_params_parse(5, const_cast<char **>(reverse), cache_params, LLAMA_EXAMPLE_SERVER));
+        assert((decode ? cache_params.moe_stream_slots_decode : cache_params.moe_stream_slots) == 64);
+        assert((decode ? cache_params.moe_stream_budget_decode : cache_params.moe_stream_budget) == 0);
+    }
+
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
                                    int32_t total, int32_t per_seq) {
         const auto limits = common_speculative_get_output_limits(n_batch, n_parallel, n_draft);
