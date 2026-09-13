@@ -1,3 +1,4 @@
+#include <vector>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -249,9 +250,13 @@ struct server_slot {
     mtmd::batch_ptr mbatch = nullptr;
 
     // speculative decoding
-    common_speculative * spec;
+    common_speculative * spec = nullptr;
+
+    int32_t spec_n_prompt_max = 0;
+    bool spec_context_synced = true;
 
     llama_tokens spec_draft;
+
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -314,6 +319,10 @@ struct server_slot {
             return false;
         }
 
+        // the drafter's carryover rides with the KV: without it a restore has to resynchronize,
+        // which throws away the draft state this function just saved
+        cur->data.hbnd = common_speculative_boundary_get(spec, id);
+
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -323,9 +332,35 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        std::vector<uint8_t> hbnd;
+        bool restored = false;
+
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &hbnd, &restored);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+            return res;
+        }
+
+        // A miss also returns true, and leaves this slot's prompt and drafter untouched - both are
+        // still consistent with each other, so resetting here would throw away live carryover.
+        if (!restored) {
+            return res;
+        }
+
+        // Drop whatever this slot's drafter was carrying - it describes the previous conversation -
+        // then put back the carryover saved with this entry. boundary_set checks it against the
+        // position the restored prefix continues at, so a stale or foreign one is refused and the
+        // drafter resynchronizes instead of drafting from it.
+        common_speculative_reset(spec, id);
+
+        const bool bnd = common_speculative_boundary_set(spec, id, hbnd.data(), hbnd.size(),
+                                                         (llama_pos) prompt.tokens.size());
+
+        spec_context_synced = (bnd && common_speculative_has_boundary_state(spec, id)) ||
+                              !common_speculative_needs_context_sync(spec);
+
+        if (!spec_context_synced) {
+            SLT_INF(*this, "%s", "prompt cache hit without usable draft boundary state, resynchronizing\n");
         }
 
         return res;
@@ -335,6 +370,8 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_reset(spec, id);
+        spec_context_synced = true;
 
         prompt.clear();
     }
@@ -471,6 +508,11 @@ struct server_slot {
         return !!spec;
     }
 
+    bool wants_speculation() const {
+        return can_speculate() &&
+            (spec_n_prompt_max == 0 || task == nullptr || task->n_tokens() <= spec_n_prompt_max);
+    }
+
     void add_token(const completion_token_output & token) {
         if (!is_processing()) {
             SLT_WRN(*this, "%s", "slot is not processing\n");
@@ -483,7 +525,7 @@ struct server_slot {
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
-        if (!can_speculate()) {
+        if (!wants_speculation()) {
             return 0;
         }
 
@@ -689,7 +731,7 @@ struct server_slot {
         res = {
             {"id",            id},
             {"n_ctx",         n_ctx},
-            {"speculative",   can_speculate()},
+            {"speculative",   wants_speculation()},
             {"is_processing", is_processing()},
         };
 
@@ -1409,6 +1451,7 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+            slot.spec_n_prompt_max = params_base.speculative.n_prompt_max;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1464,6 +1507,8 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        // A reload may disable caching; do not retain the old instance in that case.
+        prompt_cache.reset();
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -2759,6 +2804,10 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // The state file does not contain the draft context: force a synchronized
+                        // prefill before a later request enables speculation.
+                        slot->spec_context_synced = !common_speculative_needs_context_sync(spec.get());
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3125,7 +3174,7 @@ private:
                 const int n_draft_max = slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
-                    GGML_ASSERT(slot.can_speculate());
+                    GGML_ASSERT(slot.wants_speculation());
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
@@ -3139,6 +3188,10 @@ private:
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+
+                        // the carryover belongs to this position too - rewinding KV without it
+                        // leaves the drafter pairing a hidden state from further ahead
+                        common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
 
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3187,6 +3240,10 @@ private:
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }
+
+            // rewind the boundary with the KV, whichever way the KV got there. A no-op when the
+            // implementation stashed nothing.
+            common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
             if (!draft.empty()) {
                 const bool use_ckpt_tgt =
@@ -3284,6 +3341,17 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        // A long request may have advanced only the target context while its draft
+                        // prefill was intentionally skipped. If speculation becomes worthwhile again,
+                        // rebuild both contexts from position zero instead of pairing a cached target
+                        // prefix with stale draft state.
+                        const bool force_spec_prefill = slot.wants_speculation() && !slot.spec_context_synced;
+                        if (force_spec_prefill) {
+                            SLT_INF(slot, "%s", "rebuilding prompt to synchronize the speculative context\n");
+                            common_speculative_reset(spec.get(), slot.id);
+                            slot.spec_context_synced = true;
+                        }
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -3335,7 +3403,7 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt && !force_spec_prefill) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3906,7 +3974,19 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        bool batch_wants_speculation = false;
         if (spec) {
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                GGML_ASSERT(batch_view.n_seq_id[i] == 1);
+                const llama_seq_id seq_id = batch_view.seq_id[i][0];
+                if (seq_id >= 0 && seq_id < (llama_seq_id) slots.size() && slots[seq_id].wants_speculation()) {
+                    batch_wants_speculation = true;
+                    break;
+                }
+            }
+        }
+
+        if (batch_wants_speculation) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
@@ -3917,6 +3997,15 @@ private:
 
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
+            }
+        } else if (spec) {
+            // The target advanced without the draft. Remember the gap so a future short request
+            // cannot reuse this target prefix with an unsynchronized draft context.
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                const llama_seq_id seq_id = batch_view.seq_id[i][0];
+                if (seq_id >= 0 && seq_id < (llama_seq_id) slots.size()) {
+                    slots[seq_id].spec_context_synced = false;
+                }
             }
         }
 
@@ -4020,14 +4109,14 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                if (slot.can_speculate()) {
+                if (slot.wants_speculation()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
 
-            if (slot.can_speculate() && !slot.spec_draft.empty()) {
+            if (slot.wants_speculation() && !slot.spec_draft.empty()) {
                 return; // sample using speculative decoding
             }
 
@@ -4080,7 +4169,7 @@ private:
 
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
+            if (slot.state != SLOT_STATE_GENERATING || !slot.wants_speculation() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
             }
@@ -4096,11 +4185,16 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+
+                std::vector<llama_token> accepted;
+                if (!synth_probs.empty()) {
+                    accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4118,7 +4212,6 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 
@@ -4131,6 +4224,9 @@ private:
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
+
+                        // as above: the drafter's carryover is part of this checkpoint's moment
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 

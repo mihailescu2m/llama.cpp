@@ -598,8 +598,13 @@ struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
 
+    // The drafter's boundary carryover. A few tens of KiB against KV states in the MiB-GiB range,
+    // so it stays in memory; disk-backed entries also write it beside their state (.hbnd) so a
+    // restart keeps it.
+    std::vector<uint8_t> hbnd;
+
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + hbnd.size();
     }
 };
 
@@ -638,7 +643,11 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // Returns true even when no better cached prompt was found - that is a MISS, not a failure,
+    // and the slot keeps what it already had. restored_out distinguishes the two; hbnd_out receives
+    // the matched entry's drafter boundary blob, empty when it carried none.
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+              std::vector<uint8_t> * hbnd_out = nullptr, bool * restored_out = nullptr);
 
     void update();
 };

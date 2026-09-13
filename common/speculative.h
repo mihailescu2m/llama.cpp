@@ -73,6 +73,24 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// reset per-sequence carry state before rebuilding a draft context from an uncached prompt
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
+
+// whether a restored target context must be reprocessed to resynchronize the draft state
+// false when every implementation derives its drafts from the prompt alone (ngram)
+bool common_speculative_needs_context_sync(const common_speculative * spec);
+
+// whether the drafter holds boundary state valid for seq_id. Restoring draft KV does not restore
+// it, so a restore must not claim the context is synchronized without checking this.
+bool common_speculative_has_boundary_state(const common_speculative * spec, llama_seq_id seq_id);
+
+// serialize / restore that boundary state so it can travel with the draft KV. set() checks the
+// blob against the position the restored prefix continues at and fails rather than drafting from
+// a carryover taken somewhere else.
+std::vector<uint8_t> common_speculative_boundary_get(const common_speculative * spec, llama_seq_id seq_id);
+bool common_speculative_boundary_set(common_speculative * spec, llama_seq_id seq_id,
+                                     const uint8_t * data, size_t n, llama_pos expect_next_pos);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 

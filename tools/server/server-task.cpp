@@ -1827,7 +1827,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                               std::vector<uint8_t> * hbnd_out, bool * restored_out) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1896,7 +1897,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
+        if (restored_out != nullptr) {
+            *restored_out = true;
+        }
+
         prompt = std::move(it_best->prompt);
+
+        // hand back the drafter's carryover before the entry goes: the caller validates it against
+        // the restored prefix and resynchronizes if it does not line up
+        if (hbnd_out != nullptr) {
+            *hbnd_out = std::move(it_best->data.hbnd);
+        }
 
         states.erase(it_best);
     }

@@ -1607,11 +1607,17 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     tmp.push_back(0);
     tmp.push_back(0);
 
-    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
-    if (ret != 0) {
-        COM_ERR("llama_decode() failed: %d\n", ret);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-        goto done;
+    // The probe still needs two positions when the caller configured a one-token batch.
+    // Let the second chunk continue from the first, just as ordinary chunked decode does.
+    for (size_t offset = 0; offset < tmp.size();) {
+        const int32_t n_tokens = (int32_t) std::min<size_t>(llama_n_batch(ctx), tmp.size() - offset);
+        int ret = llama_decode(ctx, llama_batch_get_one(tmp.data() + offset, n_tokens));
+        if (ret != 0) {
+            COM_ERR("llama_decode() failed: %d\n", ret);
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+            goto done;
+        }
+        offset += n_tokens;
     }
 
     // try to remove the last tokens

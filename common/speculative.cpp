@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-state.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -14,9 +15,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <cinttypes>
 
@@ -54,6 +58,23 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
         result += ggml_backend_dev_name(devices[i]);
     }
     return result.empty() ? "default" : result;
+}
+
+static uint32_t common_speculative_env_u32(const char * name, uint32_t fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > std::numeric_limits<uint32_t>::max()) {
+        SPC_WRN("ignoring invalid %s='%s'\n", name, value);
+        return fallback;
+    }
+
+    return (uint32_t) parsed;
 }
 
 struct common_speculative_config {
@@ -135,6 +156,10 @@ using common_speculative_draft_params_vec = std::vector<common_speculative_draft
 //
 // each implementation has a unique type and a state that is implementation-specific
 // in a subclass of common_speculative_impl
+// on-disk layout of a drafter's boundary carryover. Fixed width, no padding surprises: the
+// fields are ordered largest-first and the struct is checked against the blob size on load.
+using boundary_hdr = common_speculative_state::boundary_header;
+
 struct common_speculative_impl {
     const common_speculative_type type;
 
@@ -162,6 +187,31 @@ struct common_speculative_impl {
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
     virtual ~common_speculative_impl() = default;
+
+    virtual void reset(llama_seq_id /*seq_id*/) {}
+
+    // Restoring draft KV is not enough on its own: an implementation may also carry a boundary
+    // hidden state that lives in RAM and is not persisted with it. Returning false here forces a
+    // resynchronization instead of drafting from a zeroed or foreign boundary.
+    virtual bool has_boundary_state(llama_seq_id /*seq_id*/) const { return true; }
+
+    // Serialize that boundary state so it can travel with the draft KV. Empty means none, which
+    // set() below must then accept trivially - most implementations keep nothing here.
+    virtual std::vector<uint8_t> boundary_state_get(llama_seq_id /*seq_id*/) const { return {}; }
+
+    // an implementation with no boundary state has nothing to restore and nothing to fail on -
+    // it must not reject a blob that belongs to a sibling implementation
+    virtual bool boundary_state_set(llama_seq_id /*seq_id*/, const uint8_t * /*data*/, size_t /*n*/,
+                                    llama_pos /*expect_next_pos*/) { return true; }
+
+    // A restored target prefix cannot be paired with draft KV that was never persisted, so the
+    // prompt has to be reprocessed. Prompt-derived implementations override this.
+    virtual bool needs_context_sync() const {
+        SPC_INF("%s keeps a draft context - its KV is not persisted, so context load is "
+                "disabled and the restored prompt will be reprocessed\n",
+                common_speculative_type_to_str(type).c_str());
+        return true;
+    }
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
@@ -330,6 +380,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
+                auto & dp = dparams.at(seq_id);
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
@@ -343,7 +394,6 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
@@ -499,7 +549,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -567,6 +617,18 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 2);
         }
+    }
+
+    void reset(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_g_last[seq_id].begin(), pending_g_last[seq_id].end(), 0.0f);
+        pending_pos_last[seq_id] = -1;
+        verify_g[seq_id].clear();
+        verify_pos_first[seq_id] = -1;
+        verify_g_rows[seq_id] = 0;
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -870,6 +932,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        // a failed capture must not leave the caller's buffer holding an earlier checkpoint's bytes
+        data.clear();
+
         if (!need_boundary_stash()) {
             return false;
         }
@@ -877,12 +942,18 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             return false;
         }
 
-        const llama_pos          pos = pending_pos_last[seq_id];
         const std::vector<float> & g = pending_g_last[seq_id];
+        if (g.size() != (size_t) n_embd_dec) {
+            return false;
+        }
+        boundary_hdr hdr;
+        hdr.magic  = common_speculative_state::magic_eagle3;
+        hdr.n_embd = n_embd_dec;
+        hdr.pos    = pending_pos_last[seq_id];
 
-        data.resize(sizeof(llama_pos) + g.size() * sizeof(float));
-        std::memcpy(data.data(),                     &pos,     sizeof(llama_pos));
-        std::memcpy(data.data() + sizeof(llama_pos), g.data(), g.size() * sizeof(float));
+        data.resize(sizeof(hdr) + g.size() * sizeof(float));
+        std::memcpy(data.data(),               &hdr,     sizeof(hdr));
+        std::memcpy(data.data() + sizeof(hdr), g.data(), g.size() * sizeof(float));
         return true;
     }
 
@@ -893,16 +964,21 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
-        if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
+
+        boundary_hdr hdr;
+        const auto result = common_speculative_state::read_boundary(data.data(), data.size(),
+                common_speculative_state::magic_eagle3, n_embd_dec, -1, hdr);
+        if (result == common_speculative_state::boundary_result::invalid) {
+            reset(seq_id);
+            return;
+        }
+        if (result == common_speculative_state::boundary_result::foreign) {
             return;
         }
 
-        llama_pos pos = -1;
-        std::memcpy(&pos, data.data(), sizeof(llama_pos));
-
-        pending_pos_last[seq_id] = pos;
+        pending_pos_last[seq_id] = hdr.pos;
         pending_g_last[seq_id].resize(n_embd_dec);
-        std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(hdr), (size_t) n_embd_dec * sizeof(float));
     }
 };
 
@@ -1031,7 +1107,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (this->params.backend_sampling && !is_dflash2) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1352,6 +1428,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
 
+    // The target position pending_h was taken at; it pairs with the token at pending_pos + 1.
+    // -1 means no cycle has produced one. This is what makes the carryover restorable: i_last is
+    // a batch row index and means nothing once that batch is gone.
+    std::vector<llama_pos>              pending_pos;
+    std::vector<std::vector<llama_pos>> verify_pos;
+
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
@@ -1431,11 +1513,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 c.reserve((size_t) (this->params.n_max + 1) * n_embd);
             }
         }
-        this->n_max = this->params.n_max;
-
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
+        pending_pos.assign(n_seq, -1);
+        verify_pos.assign(n_seq, {});
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
@@ -1478,6 +1560,90 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     "(need_embd / logits=1 on every prompt position?). "
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 1);
+        }
+    }
+
+    // pending_h is the target hidden state the next catch-up row consumes. Valid exactly when a
+    // position was recorded for it, whether by a decode cycle or by a restore.
+    bool has_boundary_state(llama_seq_id seq_id) const override {
+        return seq_id >= 0 && seq_id < (llama_seq_id) n_seq && pending_pos[seq_id] >= 0;
+    }
+
+    // Checkpoints stash spec state in data_spec and rewind it with the KV. Sharing the boundary
+    // blob here is what makes a rewind coherent: without it the KV goes back to the checkpoint's
+    // position while pending_h still holds the carryover from wherever generation had reached.
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        data = boundary_state_get(seq_id);
+        return !data.empty();
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        // the checkpoint carries KV and boundary from the same moment, so the blob's own position
+        // is authoritative and there is no external expectation to check it against
+        if (!data.empty() && boundary_state_set(seq_id, data.data(), data.size(), -1)) {
+            return;
+        }
+
+        // Ignore only a complete, recognized sibling's record. Everything else (including an
+        // empty checkpoint and corrupt magic) must not retain the live, post-checkpoint boundary.
+        boundary_hdr hdr;
+        if (common_speculative_state::read_boundary(data.data(), data.size(),
+                common_speculative_state::magic_mtp, n_embd, -1, hdr) !=
+                common_speculative_state::boundary_result::foreign) {
+            reset(seq_id);
+        }
+    }
+
+    std::vector<uint8_t> boundary_state_get(llama_seq_id seq_id) const override {
+        if (!has_boundary_state(seq_id)) {
+            return {};
+        }
+
+        boundary_hdr hdr;
+        hdr.n_embd = n_embd;
+        hdr.pos    = pending_pos[seq_id];
+
+        std::vector<uint8_t> out(sizeof(hdr) + (size_t) n_embd*sizeof(float));
+        std::memcpy(out.data(), &hdr, sizeof(hdr));
+        std::memcpy(out.data() + sizeof(hdr), pending_h[seq_id].data(), (size_t) n_embd*sizeof(float));
+
+        return out;
+    }
+
+    // expect_next_pos is the position the restored prefix will continue at, so the carryover is
+    // only usable if it was taken from the token immediately before it.
+    bool boundary_state_set(llama_seq_id seq_id, const uint8_t * data, size_t n, llama_pos expect_next_pos) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        boundary_hdr hdr;
+        if (common_speculative_state::read_boundary(data, n, common_speculative_state::magic_mtp,
+                n_embd, expect_next_pos, hdr) != common_speculative_state::boundary_result::valid) {
+            return false;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), data + sizeof(hdr), (size_t) n_embd*sizeof(float));
+        pending_pos[seq_id] = hdr.pos;
+
+        return true;
+    }
+
+    void reset(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        pending_pos[seq_id] = -1;
+        verify_pos[seq_id].clear();
+        i_last[seq_id] = -1;
+        i_batch_beg[seq_id] = -1;
+        i_batch_end[seq_id] = -1;
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        if (chain_heads) {
+            chain_h[seq_id].clear();
         }
     }
 
@@ -1543,7 +1709,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                // (h_p, x_{p+1}): the carryover pairs only with the token immediately after the
+                // position it was taken at, which is what makes a restored one safe to use. A gap
+                // means it belongs to a different prefix - zero the row rather than feed it, and
+                // say so, because silently drafting from the wrong h only shows up as lost
+                // acceptance. eagle3 makes the same test at its own boundary.
+                const int32_t beg = i_batch_beg[seq_id];
+
+                if (pending_pos[seq_id] >= 0 && pending_pos[seq_id] + 1 == batch_in.pos[beg]) {
+                    set_h(beg, pending_h[seq_id].data());
+                } else {
+                    if (pending_pos[seq_id] >= 0) {
+                        SPC_INF("draft boundary at pos %d does not meet batch start %d, using a zero row\n",
+                                (int) pending_pos[seq_id], (int) batch_in.pos[beg]);
+                    }
+                    std::memset(batch.embd + (size_t) beg * n_embd, 0, row_bytes);
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1586,14 +1767,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            verify_pos[seq_id].resize((size_t) n_rows);
 
             for (int32_t i = 0; i < n_rows; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                verify_pos[seq_id][i] = batch_in.pos[i_batch_beg[seq_id] + i];
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
+            // The carryover and its position are one value. Advancing h without the position
+            // leaves the consumer comparing a fresh row against a stale pos, which discards a
+            // perfectly good carryover at every prefill-chunk boundary.
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            pending_pos[seq_id] = verify_pos[seq_id][n_rows - 1];
         }
 
         return true;
@@ -1679,10 +1866,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
+                auto & dp = dparams.at(seq_id);
                 const llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
+                // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -1692,12 +1880,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                const int32_t n_mtp_max = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+                if (n_mtp_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1760,14 +1948,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        // h and its position are one value; verify_h and verify_pos are sized together, so a
+        // mismatch here is a bug rather than a case to tolerate - tolerating it would pair a fresh
+        // hidden state with a stale position and then persist that pair.
+        GGML_ASSERT(verify_pos[seq_id].size() == (size_t) n_rows);
+
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        pending_pos[seq_id] = verify_pos[seq_id][i_h];
     }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+
+    // drafts come from the prompt alone; begin() rebuilds the container after a restore
+    bool needs_context_sync() const override { return false; }
     common_params_speculative_ngram_map params;
 
     // shared across all sequences
@@ -1813,6 +2011,9 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
 };
 
 struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
+
+    // drafts come from the prompt alone; begin() rebuilds the container after a restore
+    bool needs_context_sync() const override { return false; }
     // n_seq configs
     std::vector<common_ngram_map> config;
 
@@ -1867,6 +2068,9 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 };
 
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
+
+    // drafts come from the prompt alone; begin() rebuilds the container after a restore
+    bool needs_context_sync() const override { return false; }
     common_params_speculative_ngram_mod params;
 
     // shared across all sequences
@@ -2042,6 +2246,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 };
 
 struct common_speculative_impl_ngram_cache : public common_speculative_impl {
+
+    // drafts come from the prompt alone; begin() rebuilds the container after a restore
+    bool needs_context_sync() const override { return false; }
     common_params_speculative_ngram_cache params;
 
     uint16_t n_draft;
@@ -2538,13 +2745,34 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_block = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // The draft inherits the target's expert-cache budget. For a small MoE drafter that can
+    // accidentally cover every expert, disable streaming, and consume memory needed by the target.
+    // Zero keeps the inherited setting.
+    if (mparams.moe_stream) {
+        const uint32_t slots = common_speculative_env_u32("LLAMA_SPEC_DRAFT_MOE_SLOTS", 96);
+        if (slots > 0) {
+            mparams.moe_stream_slots  = slots;
+            mparams.moe_stream_budget = 0;
+        }
+    }
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
+
+    // A "shared-" MTP sidecar ships without token_embd and borrows the target's, so it needs to
+    // know which model to borrow from before it is loaded. Harmless for a sidecar that carries
+    // its own: the donor is only consulted when the tensor is absent.
+    mparams.tensor_donor = llama_get_model(ctx_tgt);
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
@@ -2553,6 +2781,31 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // DFlash and DSpark chunk target prompt batches into their own ubatches in process(). Their
+    // draft step only needs n_seq*(n_max + 1) rows, so carrying the target's large batch buffers
+    // wastes GBs for an MoE drafter. Do not apply this to draft-simple, whose process() forwards
+    // the target batch directly and therefore must retain the target's n_batch acceptance bound.
+    if (spec_block) {
+        const uint64_t n_draft_rows =
+                (uint64_t) cparams.n_seq_max * (uint64_t) (std::max(0, params.speculative.draft.n_max) + 1);
+        const uint32_t n_batch_dft = (uint32_t) std::min<uint64_t>(
+                std::max<uint64_t>(512, n_draft_rows), std::numeric_limits<uint32_t>::max());
+
+        cparams.n_batch  = std::min(cparams.n_batch,  n_batch_dft);
+        cparams.n_ubatch = std::min(cparams.n_ubatch, n_batch_dft);
+    }
+
+    // MTP must accept the target's complete logical batch, but llama_decode can split it into
+    // smaller physical batches. Its 512-expert head and four residual streams make the target's
+    // large ubatch unnecessarily expensive. Zero keeps the target ubatch for A/B testing.
+    if (spec_mtp) {
+        const uint32_t n_ubatch_dft = common_speculative_env_u32("LLAMA_SPEC_DRAFT_UBATCH", 1024);
+        if (n_ubatch_dft > 0 && cparams.n_ubatch > n_ubatch_dft) {
+            SPC_INF("MTP draft ubatch %u -> %u\n", cparams.n_ubatch, n_ubatch_dft);
+            cparams.n_ubatch = n_ubatch_dft;
+        }
+    }
 
     std::string model_path;
     if (has_draft) {
@@ -2778,6 +3031,79 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     return spec->dparams[seq_id];
 }
 
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size());
+    spec->dparams[seq_id] = {};
+    for (auto & impl : spec->impls) {
+        impl->reset(seq_id);
+    }
+}
+
+std::vector<uint8_t> common_speculative_boundary_get(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return {};
+    }
+
+    // at most one implementation carries boundary state; the first non-empty blob is it
+    for (const auto & impl : spec->impls) {
+        auto blob = impl->boundary_state_get(seq_id);
+        if (!blob.empty()) {
+            return blob;
+        }
+    }
+
+    return {};
+}
+
+bool common_speculative_boundary_set(common_speculative * spec, llama_seq_id seq_id,
+                                     const uint8_t * data, size_t n, llama_pos expect_next_pos) {
+    if (spec == nullptr) {
+        return n == 0;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (!impl->boundary_state_set(seq_id, data, n, expect_next_pos)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool common_speculative_has_boundary_state(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return true;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (!impl->has_boundary_state(seq_id)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool common_speculative_needs_context_sync(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    // ask every implementation so each draft one reports why the context was dropped
+    bool need = false;
+    for (const auto & impl : spec->impls) {
+        if (impl->needs_context_sync()) {
+            need = true;
+        }
+    }
+
+    return need;
+}
+
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
     if (spec == nullptr) {
         return;
@@ -2927,6 +3253,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
 // TODO: support the case of more than one speculative implementations having a state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
     if (spec == nullptr) {
         return false;
     }
