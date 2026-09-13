@@ -15,6 +15,7 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-state-key.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
@@ -32,6 +33,15 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
+    llama_build_and_test(${PROJECT_SOURCE_DIR}/tests/test-server-prompt-cache.cpp)
+    target_link_libraries(test-server-prompt-cache PRIVATE server-context)
+endif()
+
+if (LLAMA_SERVER_PCH)
+    target_precompile_headers(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/common/common.h)
+endif()
 
 # llama-server-impl: server logic, reusable by app
 

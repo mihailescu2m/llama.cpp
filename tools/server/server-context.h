@@ -97,6 +97,11 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // --slot-persist. persist_slot() must run BEFORE terminate(), while the context is still
+    // alive; restore_slot() after load_model().
+    bool persist_slot();
+    bool restore_slot();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

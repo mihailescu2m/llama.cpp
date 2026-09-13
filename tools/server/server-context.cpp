@@ -7,7 +7,9 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-state-key.h"
 #include "server-speculative.h"
+#include "server-persist.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -25,7 +27,9 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <list>
 #include <random>
+#include <unordered_map>
 #include <utility>
 #include <fstream>
 
@@ -391,6 +395,16 @@ struct server_slot {
         // which throws away the draft state this function just saved
         cur->data.hbnd = common_speculative_boundary_get(spec, id);
 
+        if (prompt_cache.disk_backed()) {
+            // stream the sequence into its file; nothing about it is ever held on the heap
+            if (!prompt_cache.save_direct(*cur, ctx_tgt, ctx_dft, id, prompt.checkpoints)) {
+                prompt_cache.erase_last();
+                return false;
+            }
+
+            return true;
+        }
+
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -402,8 +416,9 @@ struct server_slot {
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         std::vector<uint8_t> hbnd;
         bool restored = false;
+        bool draft_restored = false;
 
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &hbnd, &restored);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &hbnd, &restored, &draft_restored);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
             return res;
@@ -421,7 +436,8 @@ struct server_slot {
         // drafter resynchronizes instead of drafting from it.
         common_speculative_reset(spec, id);
 
-        const bool bnd = common_speculative_boundary_set(spec, id, hbnd.data(), hbnd.size(),
+        const bool bnd = (ctx_dft == nullptr || draft_restored) &&
+                        common_speculative_boundary_set(spec, id, hbnd.data(), hbnd.size(),
                                                          (llama_pos) prompt.tokens.size());
 
         spec_context_synced = (bnd && common_speculative_has_boundary_state(spec, id)) ||
@@ -1187,6 +1203,10 @@ private:
 
         const bool is_resume = sleeping;
 
+        // This instance survives sleep/reload. Neither its files nor its fitted configuration
+        // necessarily do, so never reuse the preceding load's memoized disk-cache identity.
+        model_state_id_str.clear();
+        model_state_id_ready = false;
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
@@ -1601,6 +1621,22 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        // Both disk tiers key their directory on the weights fingerprint and both fall back to
+        // "off" when it cannot be computed. Say so once, here: the context-cache branch below
+        // would otherwise report a cache the user asked for as merely unconfigured, and
+        // persist_dir() runs too often to warn from.
+        if ((!params_base.context_cache_path.empty() ||
+             (params_base.slot_persist && !params_base.slot_save_path.empty())) &&
+            model_state_id_cached().empty()) {
+            if (!params_base.lora_adapters.empty()) {
+                SRV_WRN("%s", "context cache and slot persistence disabled: per-request LoRA state "
+                              "is not represented in the automatic disk-cache format\n");
+            } else {
+                SRV_WRN("%s", "context cache and slot persistence disabled: a model, draft or control "
+                              "vector file could not be identified, or changed during identification\n");
+            }
+        }
+
         // A reload may disable caching; do not retain the old instance in that case.
         prompt_cache.reset();
         if (params_base.cache_ram_mib != 0) {
@@ -1612,6 +1648,30 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+        } else if (!params_base.context_cache_path.empty() && !model_state_id_cached().empty()) {
+            // Disk tier. Files and graph/cache configuration identify the state, not a model name.
+            // An empty id disables reuse when the identity cannot be established safely.
+            const std::string dir = params_base.context_cache_path + "/" + model_state_id_cached();
+
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+
+            // error_code throughout: a problem with the cache directory must never stop the
+            // server from starting, it just means no context cache this run.
+            if (ec) {
+                SRV_WRN("context cache: cannot use %s (%s), continuing without it\n", dir.c_str(), ec.message().c_str());
+            }
+
+            SRV_INF("context cache: %s, %d slots, RAM tier %s\n",
+                    dir.c_str(), params_base.context_cache_slots,
+                    params_base.cache_ram_mib == 0 ? "off" : "on");
+
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                    params_base.cache_ram_mib, n_ctx, dir, params_base.context_cache_slots);
+
+            // Entries a previous run left here are indexed again. The directory is keyed by the model
+            // state id, so they were written by these same files and settings.
+            prompt_cache->restore_index(ctx_tgt, mctx != nullptr);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1797,6 +1857,327 @@ private:
         }
 
         return nullptr;
+    }
+
+    // Identify files once per model load, not once per server instance: load_model invalidates
+    // this memo on wake/reload. Files must not be edited while their model is in use.
+    mutable std::string model_state_id_str;
+    mutable bool        model_state_id_ready = false;
+
+    const std::string & model_state_id_cached() const {
+        if (!model_state_id_ready) {
+            model_state_id_str   = server_model_state_id(params_base.model.path, params_base);
+            model_state_id_ready = true;
+        }
+
+        return model_state_id_str;
+    }
+
+    std::string persist_dir() const {
+        if (!params_base.slot_persist || params_base.slot_save_path.empty()) {
+            return {};
+        }
+
+        // one state per set of files and settings, never per model filename
+        const std::string & id = model_state_id_cached();
+        if (id.empty()) {
+            return {};
+        }
+
+        return params_base.slot_save_path + "/" + id;
+    }
+
+    // The most recently used slot, not slot 0: with several slots the interesting conversation is
+    // the one that was last active, and slot 0 may hold something stale.
+    server_slot * persist_pick_slot() {
+        server_slot * best = nullptr;
+        for (auto & slot : slots) {
+            if (slot.prompt.tokens.size() == 0) {
+                continue;
+            }
+            if (best == nullptr || slot.t_last_used > best->t_last_used) {
+                best = &slot;
+            }
+        }
+        return best;
+    }
+
+    bool persist_slot_state() {
+        // With a disk context cache the active conversation is saved into it like any other entry, so
+        // the next start indexes it with the rest - with or without --slot-persist.
+        if (prompt_cache && prompt_cache->disk_backed()) {
+            server_slot * slot = persist_pick_slot();
+            if (slot == nullptr) {
+                return false;
+            }
+            if (slot->is_processing()) {
+                SRV_WRN("%s", "context cache: slot still processing, not saving it on exit\n");
+                return false;
+            }
+            const bool saved = slot->prompt_save(*prompt_cache);
+            SRV_INF("context cache: active conversation (%zu tokens) %s on exit\n",
+                    slot->prompt.tokens.size(), saved ? "saved" : "already saved");
+            return saved;
+        }
+
+        const std::string dir = persist_dir();
+        if (dir.empty()) {
+            return false;
+        }
+
+        server_slot * slot = persist_pick_slot();
+        if (slot == nullptr) {
+            SRV_INF("%s", "slot persist: nothing to save\n");
+            return false;
+        }
+
+        // Mid-generation the slot's KV holds draft tokens the token list does not, so the two
+        // would not agree on restore. Refuse rather than write a state that cannot be trusted.
+        if (slot->is_processing()) {
+            SRV_WRN("%s", "slot persist: slot still processing, not saving\n");
+            return false;
+        }
+
+        std::vector<char> packed;
+        try {
+            packed = slot->prompt.tokens.serialize();
+        } catch (const std::exception & err) {
+            SRV_WRN("slot persist: %s\n", err.what());
+            return false;
+        }
+        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+
+        const std::string final_path = dir + "/state.bin";
+        const std::string tmp_path   = final_path + ".tmp";   // atomic: a truncated save is never valid
+
+        // Drop the commit record before touching anything. From here until the record is written
+        // again the set on disk is a mixture, and every exit path in between - a failed write, a
+        // failed rename, a kill - leaves it saying so.
+        std::error_code gen_error;
+        std::filesystem::remove(slot_gen_path(final_path), gen_error);
+        if (gen_error) {
+            SRV_WRN("slot persist: cannot invalidate the previous commit record (%s), skipping save\n",
+                    gen_error.message().c_str());
+            return false;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        const size_t nwrite = llama_state_seq_save_file(
+                ctx_tgt, tmp_path.c_str(), slot->id,
+                reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (nwrite == 0) {
+            SRV_WRN("%s", "slot persist: write failed\n");
+            std::remove(tmp_path.c_str());
+            return false;
+        }
+
+        slot_ckpt_save(tmp_path, packed.data(), packed.size(), slot->prompt.tokens.size(), slot->prompt.checkpoints);
+
+        std::remove(final_path.c_str());
+        std::remove(slot_ckpt_path(final_path).c_str());
+        if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+            SRV_WRN("%s", "slot persist: rename failed\n");
+            return false;
+        }
+        if (std::rename(slot_ckpt_path(tmp_path).c_str(), slot_ckpt_path(final_path).c_str()) != 0) {
+            // fail-safe: without checkpoints the restore just re-processes, it does not misbehave
+            SRV_WRN("%s", "slot persist: checkpoint rename failed, state saved without checkpoints\n");
+        }
+
+        // A draft model keeps its own KV, and without it the restored target prefix cannot be
+        // used - the next run has to reprocess the whole prompt just to rebuild the drafter.
+        // Persist it too, in a sibling file, exactly as the context cache does. Stale or
+        // mismatched draft state is harmless: the restore treats a failed load as "no draft".
+        // the drafter's boundary carryover rides beside it: draft KV alone still forces a
+        // resynchronization, because pending_h lives in RAM and describes a position, not a cell
+        uint64_t sz_hbnd = 0;
+        uint64_t sz_drft = 0;
+
+        const std::string hbnd_path = final_path + ".hbnd";
+        std::remove(hbnd_path.c_str());
+        {
+            const auto blob = common_speculative_boundary_get(spec.get(), slot->id);
+            if (!blob.empty()) {
+                std::ofstream out(hbnd_path, std::ios::binary);
+                if (!out || !out.write((const char *) blob.data(), blob.size())) {
+                    SRV_WRN("%s", "slot persist: boundary state not saved, the next start will resynchronize\n");
+                    out.close();
+                    std::remove(hbnd_path.c_str());
+                } else {
+                    sz_hbnd = blob.size();
+                }
+            }
+        }
+
+        const std::string drft_path = final_path + ".drft";
+        std::remove(drft_path.c_str());
+        if (ctx_dft != nullptr) {
+            const std::string drft_tmp = drft_path + ".tmp";
+            const size_t n_drft = llama_state_seq_save_file(ctx_dft, drft_tmp.c_str(), slot->id, nullptr, 0);
+            if (n_drft == 0 || std::rename(drft_tmp.c_str(), drft_path.c_str()) != 0) {
+                SRV_WRN("%s", "slot persist: draft state not saved, the next start will resynchronize\n");
+                std::remove(drft_tmp.c_str());
+            } else {
+                sz_drft = n_drft;
+                SRV_INF("slot persist: saved %.1f MiB of draft state -> %s\n",
+                        (double) n_drft / 1024.0 / 1024.0, drft_path.c_str());
+            }
+        }
+
+        // Last, and only now: everything above landed, so the set is one generation.
+        slot_gen_save(final_path, slot->prompt.tokens.size(), sz_hbnd, sz_drft);
+
+        SRV_INF("slot persist: saved %zu tokens, %.1f MiB in %.2f s -> %s\n",
+                slot->prompt.tokens.size(), (double) nwrite / 1024.0 / 1024.0,
+                (ggml_time_us() - t0) / 1e6, final_path.c_str());
+        return true;
+    }
+
+    bool restore_persisted_state() {
+        // --slot-persist with a disk context cache: preload its most recent entry into the slot, so
+        // the conversation last in use continues without waiting for its read. Others load lazily.
+        if (prompt_cache && prompt_cache->disk_backed()) {
+            if (!params_base.slot_persist || slots.empty()) {
+                return false;
+            }
+            const server_prompt_cache_state * newest = prompt_cache->newest();
+            if (newest == nullptr) {
+                return false;
+            }
+            const int64_t t0 = ggml_time_us();
+            const server_tokens tokens = newest->prompt.tokens.clone();
+            server_slot & slot = slots[0];
+            if (!slot.prompt_load(*prompt_cache, tokens) || slot.prompt.tokens.size() == 0) {
+                SRV_WRN("%s", "slot persist: could not preload the newest context cache entry\n");
+                slot.prompt_clear();
+                return false;
+            }
+            SRV_INF("slot persist: preloaded %zu tokens from the context cache in %.2f s\n",
+                    slot.prompt.tokens.size(), (ggml_time_us() - t0) / 1e6);
+            return true;
+        }
+
+        const std::string dir = persist_dir();
+        if (dir.empty() || slots.empty()) {
+            return false;
+        }
+
+        const std::string filepath = dir + "/state.bin";
+        server_slot * slot = &slots[0];
+
+        // No file is the ordinary cold start, not a mismatch: say nothing rather than warning.
+        std::error_code ec;
+        if (!std::filesystem::exists(filepath, ec) || ec) {
+            return false;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        try {
+            size_t n_packed = 0;
+            llama_tokens packed;
+            size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                packed.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+            }
+            if (nread == 0) throw std::runtime_error("no space in KV cache, or the file does not match this build");
+            packed.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+            if (restored.size() > (size_t) slot->n_ctx) throw std::runtime_error("restored prompt does not fit the slot context");
+            if (!restored.validate(ctx_tgt))            throw std::runtime_error("invalid tokens in the persisted state");
+
+            std::list<common_prompt_checkpoint> checkpoints;
+            slot_ckpt_load(filepath, packed.data(), packed.size() * sizeof(llama_token), restored.size(), checkpoints);
+
+            slot->prompt.clear();
+            slot->prompt.tokens      = std::move(restored);
+            slot->prompt.checkpoints = std::move(checkpoints);
+
+            // The sidecars are only usable when the commit record says they were written by the
+            // same save as this state file. Without it they may predate it, and their own contents
+            // cannot prove otherwise. The record also says which of them that save actually wrote,
+            // so a leftover from an earlier generation is not picked up in place of one it skipped.
+            slot_gen_hdr gen = {};
+            const bool gen_ok = slot_gen_load(filepath, slot->prompt.tokens.size(), gen);
+            if (!gen_ok && (std::filesystem::exists(filepath + ".hbnd", ec) ||
+                            std::filesystem::exists(filepath + ".drft", ec))) {
+                SRV_INF("%s", "slot persist: draft sidecars are from another save, ignoring them\n");
+            }
+
+            // If the draft context was persisted alongside, restore it: both KVs then describe
+            // the same prefix, so nothing needs resynchronizing and the prompt is not reprocessed.
+            bool drft_restored = false;
+            if (ctx_dft != nullptr && gen_ok && gen.sz_drft > 0) {
+                size_t n_drft_tok = 0;
+                const std::string drft_path = filepath + ".drft";
+                // As above: the first call only reports the count, the second one loads the cells.
+                llama_tokens drft_packed;
+                std::error_code size_error;
+                const uint64_t drft_size = std::filesystem::file_size(drft_path, size_error);
+                drft_restored = !size_error && drft_size == gen.sz_drft && llama_state_seq_load_file(
+                        ctx_dft, drft_path.c_str(), slot->id, nullptr, 0, &n_drft_tok) != 0;
+                if (drft_restored) {
+                    drft_packed.resize(std::max<size_t>(1, n_drft_tok));
+                    drft_restored = llama_state_seq_load_file(ctx_dft, drft_path.c_str(), slot->id,
+                            drft_packed.data(), drft_packed.size(), &n_drft_tok) != 0;
+                }
+                if (drft_restored) {
+                    SRV_INF("slot persist: restored the draft context from %s\n", drft_path.c_str());
+                } else {
+                    SRV_INF("%s", "slot persist: no usable draft state, speculation will resynchronize\n");
+                }
+            } else if (ctx_dft != nullptr) {
+                SRV_INF("%s", "slot persist: no usable draft state, speculation will resynchronize\n");
+            }
+
+            // Otherwise the state holds no draft context: an implementation that keeps one must
+            // resynchronize; the ngram family rebuilds from the prompt and can consume this now.
+            //
+            // Restored draft KV is necessary but not sufficient. MTP also carries a boundary hidden
+            // state (pending_h) in RAM which is not written to the .drft sidecar, so after a restart
+            // it is zeroed and the first catch-up row would draft from it. Claim synchronization
+            // only when the drafter confirms it still holds that state.
+            // This path clears prompt.tokens directly rather than through prompt_clear(), so any
+            // boundary state left by a previous conversation in this slot is still live and would
+            // pass the check below while describing a different prefix. Drop it, then put back the
+            // carryover saved beside this state - boundary_set refuses one taken elsewhere.
+            common_speculative_reset(spec.get(), slot->id);
+
+            std::vector<uint8_t> hbnd;
+            if (gen_ok && gen.sz_hbnd > 0) {
+                std::ifstream in(filepath + ".hbnd", std::ios::binary);
+                if (in) {
+                    hbnd.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                }
+                if (hbnd.size() != gen.sz_hbnd) {
+                    // truncated or replaced since the record was written
+                    hbnd.clear();
+                }
+            }
+
+            common_speculative_boundary_set(spec.get(), slot->id, hbnd.data(), hbnd.size(),
+                                            (llama_pos) slot->prompt.tokens.size());
+
+            const bool drft_usable = drft_restored && common_speculative_has_boundary_state(spec.get(), slot->id);
+            if (drft_restored && !drft_usable) {
+                SRV_INF("%s", "slot persist: draft KV restored but its boundary state did not match, resynchronizing\n");
+            }
+
+            slot->spec_context_synced = drft_usable || !common_speculative_needs_context_sync(spec.get());
+
+            SRV_INF("slot persist: restored %zu tokens in %.2f s from %s\n",
+                    slot->prompt.tokens.size(), (ggml_time_us() - t0) / 1e6, filepath.c_str());
+            return true;
+        } catch (const std::exception & err) {
+            // a mismatch is a cache MISS, never a failure to start
+            SRV_WRN("slot persist: ignoring persisted state (%s)\n", err.what());
+            slot->prompt_clear();
+            return false;
+        }
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -2856,6 +3237,19 @@ private:
                         break;
                     }
 
+                    const size_t nwrite_ckpt = slot_ckpt_save(
+                            filepath,
+                            packed.data(), packed.size(),
+                            slot->prompt.tokens.size(),
+                            slot->prompt.checkpoints);
+                    if (!slot->prompt.checkpoints.empty() && nwrite_ckpt == 0) {
+                        SRV_WRN("%s\n",
+                                "slot save: checkpoint sidecar write failed; restore will fall back to re-prefill");
+                    } else {
+                        SRV_INF("slot save: %zu checkpoint(s), %.2f MiB sidecar\n",
+                                slot->prompt.checkpoints.size(), (double) nwrite_ckpt / 1024.0 / 1024.0);
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2913,12 +3307,23 @@ private:
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
+                        std::list<common_prompt_checkpoint> checkpoints;
+                        const size_t n_ckpt = slot_ckpt_load(
+                                filepath,
+                                packed.data(), packed.size() * sizeof(llama_token),
+                                restored.size(),
+                                checkpoints);
+
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->prompt.checkpoints = std::move(checkpoints);
 
-                        // The state file does not contain the draft context: force a synchronized
-                        // prefill before a later request enables speculation.
+                        // The main state file does not contain the current draft context. Even when
+                        // checkpoints were recovered, force a synchronized prefill before a later
+                        // request enables speculation; target-only use can consume them immediately.
                         slot->spec_context_synced = !common_speculative_needs_context_sync(spec.get());
+
+                        SRV_INF("slot restore: %zu checkpoint(s) recovered\n", n_ckpt);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -4611,6 +5016,14 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+bool server_context::persist_slot() {
+    return impl->persist_slot_state();
+}
+
+bool server_context::restore_slot() {
+    return impl->restore_persisted_state();
 }
 
 llama_context * server_context::get_llama_context() const {

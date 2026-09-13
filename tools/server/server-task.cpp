@@ -9,7 +9,12 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "server-persist.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 
 //
@@ -1778,6 +1783,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            erase_file(*it);
             it = states.erase(it);
         } else {
             ++it;
@@ -1790,8 +1796,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            erase_file(states.front());
             states.pop_front();
         }
+    }
+
+    // --context-cache-slots: the oldest conversations make room, and take their files with them
+    while (limit_states > 0 && !states.empty() && states.size() >= limit_states) {
+        SRV_INF(" - context cache holds %zu conversations, removing the oldest\n", states.size());
+        erase_file(states.front());
+        states.pop_front();
     }
 
     std::vector<uint8_t> state_data_tgt;
@@ -1799,8 +1813,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        // A disk-backed entry is written straight out of the context by save_direct(), so these
+        // stay empty: allocating them is exactly what put multi-GiB conversations on the heap.
+        if (!disk_backed()) {
+            state_data_tgt.resize(state_size_tgt);
+            state_data_dft.resize(state_size_dft);
+        }
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1816,7 +1834,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ disk_backed() ? std::list<common_prompt_checkpoint>{} : prompt.checkpoints,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1827,8 +1845,150 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+server_prompt_cache::~server_prompt_cache() {
+    // disk entries outlive the process: the next start indexes them again (restore_index)
+}
+
+void server_prompt_cache::erase_file(const server_prompt_cache_state & st) {
+    if (st.on_disk()) {
+        std::remove(st.path.c_str());
+        std::remove(st.path_drft().c_str());
+        std::remove(slot_ckpt_path(st.path).c_str());
+        std::remove((st.path + ".hbnd").c_str());
+        std::remove(slot_gen_path(st.path).c_str());
+    }
+}
+
+void server_prompt_cache::erase_last() {
+    if (!states.empty()) {
+        erase_file(states.back());
+        states.pop_back();
+    }
+}
+
+bool server_prompt_cache::save_direct(server_prompt_cache_state & st, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                                      const std::list<common_prompt_checkpoint> & checkpoints) {
+    if (!disk_backed()) {
+        return false;
+    }
+
+    // the token list rides in the state file, so the next start can index the entry without a context
+    std::vector<char> packed;
+    try {
+        packed = st.prompt.tokens.serialize();
+    } catch (const std::exception & err) {
+        SRV_WRN("context cache: %s, dropping the entry\n", err.what());
+        return false;
+    }
+    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+    const size_t n_tokens = st.prompt.tokens.size();
+
+    const std::string path_main = disk_path + "/ctx-" + std::to_string(n_disk++) + ".bin";
+    const std::string tmp_main  = path_main + ".tmp";
+
+    // llama_state_seq_save_file streams the sequence out of the context into the file, so the state
+    // never exists as a heap buffer. .tmp + rename so a torn write is never usable, and the commit
+    // record written last is what makes the whole set trustworthy to the next start.
+    const size_t n_main = llama_state_seq_save_file(ctx_tgt, tmp_main.c_str(), id_slot,
+            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+    if (n_main == 0) {
+        SRV_WRN("context cache: cannot write %s, dropping the entry\n", tmp_main.c_str());
+        std::remove(tmp_main.c_str());
+        return false;
+    }
+
+    // checkpoints are server state, not part of the sequence file
+    slot_ckpt_save(tmp_main, packed.data(), packed.size(), n_tokens, checkpoints);
+
+    size_t n_drft = 0;
+    if (ctx_dft != nullptr) {
+        const std::string tmp_drft = path_main + ".drft.tmp";
+
+        n_drft = llama_state_seq_save_file(ctx_dft, tmp_drft.c_str(), id_slot, nullptr, 0);
+        if (n_drft == 0 || std::rename(tmp_drft.c_str(), (path_main + ".drft").c_str()) != 0) {
+            SRV_WRN("context cache: cannot write the draft state for %s, dropping the entry\n", path_main.c_str());
+            std::remove(tmp_drft.c_str());
+            std::remove(tmp_main.c_str());
+            std::remove(slot_ckpt_path(tmp_main).c_str());
+            return false;
+        }
+    }
+
+    if (std::rename(tmp_main.c_str(), path_main.c_str()) != 0) {
+        SRV_WRN("context cache: rename failed for %s\n", tmp_main.c_str());
+        std::remove(tmp_main.c_str());
+        std::remove(slot_ckpt_path(tmp_main).c_str());
+        std::remove((path_main + ".drft").c_str());
+        return false;
+    }
+    std::error_code ec;
+    if (std::filesystem::exists(slot_ckpt_path(tmp_main), ec) &&
+            std::rename(slot_ckpt_path(tmp_main).c_str(), slot_ckpt_path(path_main).c_str()) != 0) {
+        // without checkpoints a restore re-processes more, it does not misbehave
+        std::remove(slot_ckpt_path(tmp_main).c_str());
+    }
+
+    uint64_t sz_hbnd = 0;
+    if (!st.data.hbnd.empty()) {
+        std::ofstream out(path_main + ".hbnd", std::ios::binary);
+        if (out && out.write((const char *) st.data.hbnd.data(), st.data.hbnd.size())) {
+            sz_hbnd = st.data.hbnd.size();
+        } else {
+            out.close();
+            std::remove((path_main + ".hbnd").c_str());
+        }
+    }
+    slot_gen_save(path_main, n_tokens, sz_hbnd, n_drft);
+
+    st.path      = path_main;
+    st.size_main = n_main;
+    st.size_drft = n_drft;
+    st.prompt.checkpoints.clear();
+
+    SRV_INF("context cache: wrote %.1f MiB to %s\n", (n_main + n_drft) / (1024.0 * 1024.0), path_main.c_str());
+
+    return true;
+}
+
+bool server_prompt_cache::load_direct(const server_prompt_cache_state & st, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                                      bool * draft_restored_out) {
+    if (draft_restored_out) { *draft_restored_out = false; }
+    // A NULL tokens_out only REPORTS the token count and loads nothing, so the cells are restored
+    // by the second call. The token list itself is redundant here (the entry carries its own), but
+    // the buffer has to exist for the state to be read: it is 4 bytes a token, not the KV itself.
+    auto load_one = [&](llama_context * ctx, const std::string & path) {
+        size_t n_tok = 0;
+
+        if (llama_state_seq_load_file(ctx, path.c_str(), id_slot, nullptr, 0, &n_tok) == 0) {
+            SRV_WRN("context cache: %s is gone or does not match this build\n", path.c_str());
+            return false;
+        }
+
+        llama_tokens packed(std::max<size_t>(1, n_tok));
+        if (llama_state_seq_load_file(ctx, path.c_str(), id_slot, packed.data(), packed.size(), &n_tok) == 0) {
+            SRV_WRN("context cache: cannot restore the state from %s\n", path.c_str());
+            return false;
+        }
+
+        return true;
+    };
+
+    if (!load_one(ctx_tgt, st.path)) {
+        return false;
+    }
+
+    if (ctx_dft != nullptr && st.size_drft > 0) {
+        if (!load_one(ctx_dft, st.path_drft())) { return false; }
+        if (draft_restored_out) { *draft_restored_out = true; }
+    }
+
+    return true;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-                               std::vector<uint8_t> * hbnd_out, bool * restored_out) {
+                               std::vector<uint8_t> * hbnd_out, bool * restored_out, bool * draft_restored_out) {
+    if (restored_out) { *restored_out = false; }
+    if (draft_restored_out) { *draft_restored_out = false; }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1863,31 +2023,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
+        if (it_best->on_disk()) {
+            // straight from the file into the context, no heap buffer in between
+            if (!load_direct(*it_best, ctx_tgt, ctx_dft, id_slot, draft_restored_out)) {
+                // the file vanished or does not match - drop the entry and re-prefill instead
+                erase_file(*it_best);
+                states.erase(it_best);
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
+        } else {
+            {
+                auto & data = it_best->data.main;
 
                 const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
                 if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
+                    SRV_ERR("failed to restore state with size %zu\n", size);
 
                     return false;
                 }
@@ -1895,21 +2046,56 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 data.clear();
                 data.shrink_to_fit();
             }
+
+            {
+                auto & data = it_best->data.drft;
+
+                if (!data.empty()) {
+                    GGML_ASSERT(ctx_dft);
+
+                    const size_t size = data.size();
+                    const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                    if (n != size) {
+                        SRV_WRN("failed to restore state with size %zu\n", size);
+
+                        return false;
+                    }
+
+                    data.clear();
+                    data.shrink_to_fit();
+                    if (draft_restored_out) { *draft_restored_out = true; }
+                }
+            }
         }
 
         if (restored_out != nullptr) {
             *restored_out = true;
         }
 
-        prompt = std::move(it_best->prompt);
+        if (it_best->on_disk()) {
+            // The file still describes this prefix exactly, so it stays: a crash or restart then loses
+            // nothing already saved, and a later, longer save of the conversation replaces it (alloc
+            // drops contained entries). Most recently used moves to the back.
+            prompt = it_best->prompt.clone();
+            // Checkpoints can contain large recurrent-state snapshots. Keep only the active
+            // conversation's copies in RAM, not one set per indexed disk entry.
+            const auto packed = prompt.tokens.serialize();
+            slot_ckpt_load(it_best->path, packed.data(), packed.size(), prompt.tokens.size(), prompt.checkpoints);
+            if (hbnd_out != nullptr) {
+                *hbnd_out = it_best->data.hbnd;
+            }
+            states.splice(states.end(), states, it_best);
+        } else {
+            prompt = std::move(it_best->prompt);
 
-        // hand back the drafter's carryover before the entry goes: the caller validates it against
-        // the restored prefix and resynchronizes if it does not line up
-        if (hbnd_out != nullptr) {
-            *hbnd_out = std::move(it_best->data.hbnd);
+            // hand back the drafter's carryover before the entry goes: the caller validates it against
+            // the restored prefix and resynchronizes if it does not line up
+            if (hbnd_out != nullptr) {
+                *hbnd_out = std::move(it_best->data.hbnd);
+            }
+
+            states.erase(it_best);
         }
-
-        states.erase(it_best);
     }
 
     return true;
@@ -1920,6 +2106,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            erase_file(states.front());
             states.pop_front();
         }
     }
@@ -1935,6 +2122,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            erase_file(states.front());
             states.pop_front();
         }
     }
@@ -1946,4 +2134,135 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+// One entry's index data, read without a context: tokens from the state file header, then the sidecars.
+// False when the set cannot be trusted - never written to completion, another format, or foreign tokens.
+static bool server_prompt_cache_read_entry(server_prompt_cache_state & st, const llama_context * ctx_tgt, bool has_mtmd) {
+    std::error_code ec;
+    const uint64_t file_size = std::filesystem::file_size(st.path, ec);
+    if (ec) {
+        return false;
+    }
+
+    std::ifstream in(st.path, std::ios::binary);
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    uint32_t n_tok   = 0;
+    if (!in || !in.read((char *) &magic, sizeof(magic)) || !in.read((char *) &version, sizeof(version)) ||
+            !in.read((char *) &n_tok, sizeof(n_tok)) ||
+            magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION ||
+            3*sizeof(uint32_t) + (uint64_t) n_tok*sizeof(llama_token) > file_size) {
+        return false;
+    }
+    llama_tokens packed(n_tok);
+    if (n_tok > 0 && !in.read((char *) packed.data(), (std::streamsize) (n_tok*sizeof(llama_token)))) {
+        return false;
+    }
+
+    try {
+        st.prompt.tokens = server_tokens::deserialize(packed, has_mtmd);
+    } catch (const std::exception &) {
+        return false;
+    }
+    if (st.prompt.tokens.size() == 0 || !st.prompt.tokens.validate(ctx_tgt)) {
+        return false;
+    }
+
+    // the commit record is written last: without it the set was never completed
+    slot_gen_hdr gen = {};
+    if (!slot_gen_load(st.path, st.prompt.tokens.size(), gen)) {
+        return false;
+    }
+
+    if (gen.sz_hbnd > 0) {
+        std::ifstream hb(st.path + ".hbnd", std::ios::binary);
+        if (hb) {
+            st.data.hbnd.assign(std::istreambuf_iterator<char>(hb), std::istreambuf_iterator<char>());
+        }
+        if (st.data.hbnd.size() != gen.sz_hbnd) {
+            st.data.hbnd.clear(); // truncated or replaced since the record was written
+        }
+    }
+
+    st.size_main = file_size;
+    st.size_drft = 0;
+    if (gen.sz_drft > 0) {
+        const uint64_t d = std::filesystem::file_size(st.path_drft(), ec);
+        if (!ec && d == gen.sz_drft) {
+            st.size_drft = d;
+        }
+    }
+
+    return true;
+}
+
+size_t server_prompt_cache::restore_index(const llama_context * ctx_tgt, bool has_mtmd) {
+    if (!disk_backed()) {
+        return 0;
+    }
+
+    namespace fs = std::filesystem;
+
+    struct found {
+        size_t             id;
+        fs::file_time_type mtime;
+        std::string        path;
+    };
+    std::vector<found> files;
+
+    std::error_code ec;
+    for (auto it = fs::directory_iterator(disk_path, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        // leftovers of an interrupted write are never usable
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+            std::error_code ec_rm;
+            fs::remove(it->path(), ec_rm);
+            continue;
+        }
+        if (name.size() < 9 || name.rfind("ctx-", 0) != 0 || name.compare(name.size() - 4, 4, ".bin") != 0) {
+            continue;
+        }
+        const std::string num = name.substr(4, name.size() - 8);
+        if (num.empty() || num.size() > 18 || num.find_first_not_of("0123456789") != std::string::npos) {
+            continue;
+        }
+        std::error_code ec_t;
+        const fs::file_time_type mtime = fs::last_write_time(it->path(), ec_t);
+        files.push_back({ (size_t) std::stoull(num), ec_t ? fs::file_time_type::min() : mtime, it->path().string() });
+    }
+    if (ec) {
+        SRV_WRN("context cache: cannot index %s (%s)\n", disk_path.c_str(), ec.message().c_str());
+        return 0;
+    }
+
+    // oldest first, as entries were appended
+    std::sort(files.begin(), files.end(), [](const found & a, const found & b) { return a.mtime < b.mtime; });
+
+    size_t n_tokens_total = 0;
+    for (const auto & f : files) {
+        n_disk = std::max(n_disk, f.id + 1);
+
+        server_prompt_cache_state st;
+        st.path = f.path;
+        if (!server_prompt_cache_read_entry(st, ctx_tgt, has_mtmd)) {
+            SRV_WRN("context cache: dropping unusable entry %s\n", f.path.c_str());
+            erase_file(st);
+            continue;
+        }
+        n_tokens_total += st.prompt.tokens.size();
+        states.push_back(std::move(st));
+    }
+
+    while (limit_states > 0 && states.size() > limit_states) {
+        erase_file(states.front());
+        states.pop_front();
+    }
+
+    if (!files.empty()) {
+        SRV_INF("context cache: indexed %zu of %zu entries (%zu tokens) left by a previous run in %s\n",
+                states.size(), files.size(), n_tokens_total, disk_path.c_str());
+    }
+
+    return states.size();
 }

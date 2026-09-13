@@ -612,8 +612,20 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // When the cache is disk-backed the state is streamed straight to `path` and `data` stays
+    // empty. The sizes survive so eviction accounting and the restore call know how big the
+    // state is without opening the file.
+    std::string path;
+    size_t size_main = 0;
+    size_t size_drft = 0;
+
+    bool on_disk() const { return !path.empty(); }
+
+    // the draft state rides in a sibling file so each context streams to its own blob
+    std::string path_drft() const { return path + ".drft"; }
+
     size_t size() const {
-        size_t res = data.size();
+        size_t res = on_disk() ? data.hbnd.size() : data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();
@@ -624,18 +636,35 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
+                        const std::string & disk_path = {}, int32_t limit_states_ = 0) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->disk_path    = disk_path;
+        this->limit_states = limit_states_ > 0 ? (size_t) limit_states_ : 0;
     }
 
+    ~server_prompt_cache();
+
     std::list<server_prompt_cache_state> states;
+
+    // when set, states and checkpoints live on disk; RAM holds tokens and drafter carryover
+    std::string disk_path;
+
+    // max number of cached conversations, 0 = unlimited. Used instead of a byte cap when going to
+    // disk: the natural bound there is "how many conversations are live", not how many bytes.
+    size_t limit_states = 0;
+
+    // running id, also the file name
+    size_t n_disk = 0;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    bool disk_backed() const { return !disk_path.empty(); }
 
     size_t size() const;
 
@@ -645,11 +674,34 @@ struct server_prompt_cache {
 
     // Returns true even when no better cached prompt was found - that is a MISS, not a failure,
     // and the slot keeps what it already had. restored_out distinguishes the two; hbnd_out receives
-    // the matched entry's drafter boundary blob, empty when it carried none.
+    // the matched entry's drafter boundary blob, empty when it carried none. draft_restored_out
+    // is true only after restoring draft KV, independently of whether boundary bytes exist.
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-              std::vector<uint8_t> * hbnd_out = nullptr, bool * restored_out = nullptr);
+              std::vector<uint8_t> * hbnd_out = nullptr, bool * restored_out = nullptr,
+              bool * draft_restored_out = nullptr);
 
     void update();
+
+    // Disk tier: the sequence goes straight from the context to a file and back, never through a
+    // heap buffer. At 24.0 KiB/token a 131072-token conversation is 3 GiB, and materialising a
+    // few of those is exactly what -cram 0 exists to avoid.
+    bool save_direct(server_prompt_cache_state & st, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                     const std::list<common_prompt_checkpoint> & checkpoints);
+    bool load_direct(const server_prompt_cache_state & st, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                     bool * draft_restored_out = nullptr);
+
+    void erase_file(const server_prompt_cache_state & st);
+
+    // Disk tier: rebuild the index from the entries a previous run left in disk_path - tokens from the
+    // state file header and drafter carryover from the sidecar. Checkpoints load only on a hit. Entries whose commit
+    // record is missing or does not match are deleted. Returns the number indexed.
+    size_t restore_index(const llama_context * ctx_tgt, bool has_mtmd);
+
+    // the most recently saved or used entry, null when empty
+    const server_prompt_cache_state * newest() const { return states.empty() ? nullptr : &states.back(); }
+
+    // drop the entry alloc() just appended, when writing its blob failed
+    void erase_last();
 };
 
 // used exclusively by router mode

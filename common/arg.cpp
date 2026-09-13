@@ -3993,6 +3993,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--slot-persist"},
+        "save the most recently used slot on exit and restore it on start (requires --slot-save-path).\n"
+        "with --context-cache-path the slot is saved into the context cache instead, and its most recent "
+        "entry is preloaded on start.\n"
+        "one state per set of weights: the directory is named for a hash of the model's files and settings, "
+        "so a state can never be restored into different weights",
+        [](common_params & params) {
+            params.slot_persist = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--context-cache-path"}, "PATH",
+        "spill idle conversations to this directory instead of holding them in RAM, and keep them across "
+        "restarts: the active conversation is saved on exit and every entry is indexed again on start.\n"
+        "on unified memory the RAM prompt cache competes directly with the expert cache, so a disk round "
+        "trip costs a fraction of a second against minutes of re-prefill",
+        [](common_params & params, const std::string & value) {
+            params.context_cache_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--context-cache-slots"}, "N",
+        string_format("max conversations kept in the context cache, oldest removed first (default: %d, 0 = no limit).\n"
+        "bounded by conversation count, not bytes: the natural limit is how many are live -\n"
+        "one main conversation plus a few subagents", 0),
+        [](common_params & params, int value) {
+            params.context_cache_slots = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--log-file"}, "FNAME",
         "Log to file",
         [](common_params &, const std::string & value) {

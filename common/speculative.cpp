@@ -990,6 +990,44 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
     }
 
+    bool has_boundary_state(llama_seq_id seq_id) const override {
+        return seq_id >= 0 && seq_id < (llama_seq_id) n_seq &&
+               pending_pos_last[seq_id] >= 0 && pending_g_last[seq_id].size() == (size_t) n_embd_dec;
+    }
+
+    // Disk/RAM prompt caches need the deferred row even for non-recurrent targets.
+    // Restored KV alone cannot seed Eagle3 after reset() cleared this row.
+    std::vector<uint8_t> boundary_state_get(llama_seq_id seq_id) const override {
+        if (!has_boundary_state(seq_id)) {
+            return {};
+        }
+        boundary_hdr hdr;
+        hdr.magic = common_speculative_state::magic_eagle3;
+        hdr.n_embd = n_embd_dec;
+        hdr.pos = pending_pos_last[seq_id];
+        const auto & g = pending_g_last[seq_id];
+        std::vector<uint8_t> data(sizeof(hdr) + g.size()*sizeof(float));
+        std::memcpy(data.data(), &hdr, sizeof(hdr));
+        std::memcpy(data.data() + sizeof(hdr), g.data(), g.size()*sizeof(float));
+        return data;
+    }
+
+    bool boundary_state_set(llama_seq_id seq_id, const uint8_t * data, size_t n,
+                            llama_pos expect_next_pos) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        boundary_hdr hdr;
+        if (common_speculative_state::read_boundary(data, n,
+                common_speculative_state::magic_eagle3, n_embd_dec, expect_next_pos, hdr) !=
+                common_speculative_state::boundary_result::valid) {
+            return false;
+        }
+        std::memcpy(pending_g_last[seq_id].data(), data + sizeof(hdr), (size_t) n_embd_dec*sizeof(float));
+        pending_pos_last[seq_id] = hdr.pos;
+        return true;
+    }
+
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
         // a failed capture must not leave the caller's buffer holding an earlier checkpoint's bytes
         data.clear();
@@ -997,23 +1035,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (!need_boundary_stash()) {
             return false;
         }
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
-            return false;
-        }
-
-        const std::vector<float> & g = pending_g_last[seq_id];
-        if (g.size() != (size_t) n_embd_dec) {
-            return false;
-        }
-        boundary_hdr hdr;
-        hdr.magic  = common_speculative_state::magic_eagle3;
-        hdr.n_embd = n_embd_dec;
-        hdr.pos    = pending_pos_last[seq_id];
-
-        data.resize(sizeof(hdr) + g.size() * sizeof(float));
-        std::memcpy(data.data(),               &hdr,     sizeof(hdr));
-        std::memcpy(data.data() + sizeof(hdr), g.data(), g.size() * sizeof(float));
-        return true;
+        data = boundary_state_get(seq_id);
+        return !data.empty();
     }
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {

@@ -450,6 +450,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // setup clean up function, to be called before exit
         clean_up = [&ctx_http, &ctx_server, &mcp_mgr]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
+            // --slot-persist: write the slot out FIRST, while the context is still alive and
+            // before terminate() tears it down. A no-op unless the flag is set.
+            ctx_server.persist_slot();
             // stop the session GC first, it finalizes live sessions and wakes pending readers
             server_stream_session_manager_stop();
             ctx_http.stop();
@@ -478,6 +481,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
         }
+
+        // --slot-persist: bring back the slot this model left behind. A mismatch is a cache miss,
+        // never a failure to start.
+        ctx_server.restore_slot();
 
         routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);

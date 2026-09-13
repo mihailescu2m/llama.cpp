@@ -714,6 +714,15 @@ struct common_params {
 
     std::string slot_save_path;
 
+    // --slot-persist: save the most recently used slot on exit and restore it on start, one file
+    // per set of weights under slot_save_path. A KV state is only valid for the exact weights
+    // that produced it, so the directory is keyed by local file identity and graph/cache settings.
+    bool slot_persist = false;
+
+    // --context-cache-path / --context-cache-slots: spill idle conversations to disk during a
+    // session instead of holding them in RAM, bounded by conversation count rather than bytes.
+    std::string context_cache_path;
+    int32_t     context_cache_slots = 0;
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

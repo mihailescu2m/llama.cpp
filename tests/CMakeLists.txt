@@ -155,6 +155,7 @@ llama_build_and_test(test-speculative-hybrid.cpp)
 llama_build_and_test(test-moe-wave.cpp)
 llama_build_and_test(test-top-k-determinism.cpp)
 llama_build_and_test(test-top-k-repeat.cpp)
+llama_build_and_test(test-server-state-key.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-fork-attention.cpp)
