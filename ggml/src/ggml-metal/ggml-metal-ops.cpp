@@ -1909,6 +1909,7 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2478,7 +2479,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        const int nsg    = 2;                 // num simdgroups per threadgroup
+        // num simdgroups per threadgroup; 4 for long rows at 3+ tokens (K = 6144 ssm_out / wo): a
+        // simdgroup's rows do not depend on nsg, so the result is bit-identical
+        const int nsg    = ne00 >= 4096 && ne01 >= 1024 && ne11 >= 3 ? 4 : 2;
 
         // num threads along row per simdgroup
         int16_t nxpsg = 0;
@@ -2510,6 +2513,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             default:
                 GGML_ABORT("unsupported ne11");
         };
+
+        // A matrix with few rows gets few threadgroups, each carrying every src1 row through the
+        // whole K loop. One src1 row per threadgroup instead: each output's sum depends only on
+        // nxpsg, which stays as chosen for ne11, so the result is bit-identical, and the serial
+        // chain per thread is r1ptg times shorter.
+        if (((ne01 + r0ptg - 1)/r0ptg)*((ne11 + r1ptg - 1)/r1ptg) < 64) {
+            r1ptg = 1;
+        }
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
 
@@ -2588,7 +2599,18 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+        // Q8_0 at a few tokens with K not a multiple of 128 (no mul_mv_ext): several src1 rows per
+        // threadgroup, bit-identical per output
+        int q8_nr1 = 0;
+        if (op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32 && ne11 >= 2) {
+            q8_nr1 = 2;
+            while (q8_nr1 < ne11 && q8_nr1 < 4) {
+                q8_nr1 *= 2;
+            }
+        }
+
+        auto pipeline = q8_nr1 > 0 ? ggml_metal_library_get_pipeline_mul_mv_q8_0_nr1(lib, op, q8_nr1)
+                                   : ggml_metal_library_get_pipeline_mul_mv(lib, op);
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
@@ -2832,7 +2854,19 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
         }
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
+        // IQ3_XXS: 8 rows per simdgroup; MXFP4: 4 simdgroups per threadgroup. Rows are reduced
+        // independently, so bit-identical; only when a threadgroup's rows divide ne01
+        const bool id_iq3 = op->src[0]->type == GGML_TYPE_IQ3_XXS;
+        const int  id_nr0 = id_iq3 ? 8 : N_R0_MXFP4;
+        const int  id_nsg = id_iq3 ? N_SG_IQ3_XXS : 4;
+        // the IQ3_XXS variant keeps whole rows per lane, so short rows stay on the split kernel
+        const bool id_rows = op->src[1]->type == GGML_TYPE_F32 &&
+                (id_iq3 ? ne00/32 >= 32 : op->src[0]->type == GGML_TYPE_MXFP4) && ne01 % (id_nr0*id_nsg) == 0;
+
+        auto pipeline = ne01 % 8 == 0 && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32
+                ? ggml_metal_library_get_pipeline_mul_mv_id_q8_0_nr0(lib, op, 8)
+                : id_rows ? ggml_metal_library_get_pipeline_mul_mv_id_rows(lib, op, id_nr0, id_nsg)
+                          : ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;

@@ -477,4 +477,3 @@ typedef decltype(kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_t
 
 template [[host_name("kernel_set_rows_f32_i64_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_tq2_0>;
 template [[host_name("kernel_set_rows_f32_i32_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_K, block_tq2_0, quantize_tq2_0>;
-

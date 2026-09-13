@@ -424,8 +424,6 @@ void kernel_flash_attn_ext_impl(
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
                         pm2[jj] += NW;
                     }
-
-                    continue;
                 }
 
                 if (blk_cur == 1) {

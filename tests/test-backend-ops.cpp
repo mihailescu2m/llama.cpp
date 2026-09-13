@@ -11095,6 +11095,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Expert-GEMM kernel survey at the two target models' routed-expert shapes, across every quant
+    // type the checkpoints use plus reference formats. n=512 is PP-like (a wave's rows for one
+    // expert), n=1 is TG-like. Ranking these by time per EFFECTIVE bit-per-weight - not by time
+    // alone - is what selects a checkpoint's expert mix: on this GPU the i-quant kernels are
+    // occupancy-bound and lose to simpler formats that read more bytes.
+    for (ggml_type ta : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K,
+                          GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0,
+                          GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_IQ4_XS,
+                          GGML_TYPE_Q3_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS }) {
+        // Qwen3.8-Flash-Next: ffn_gate/up_exps are [2560 -> 640]
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  640, 512, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,  640,   1, 2560, {1, 1}, {1, 1}));
+        // DeepSeek-V4-Flash-0731: ffn_gate/up_exps are [4096 -> 2048]
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2048, 512, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 2048,   1, 4096, {1, 1}, {1, 1}));
+    }
+
+    // The routed path, which is what decode actually runs. Metal picks the kernel on token
+    // count - ggml_metal_op_mul_mat_id_use_mm tests ne21 >= 32 - so the cases that matter sit
+    // either side of that boundary rather than at round numbers.
+    //   Qwen3.8-Flash-Next  512 experts, 10 active, gate/up [2560 -> 640], down [640 -> 2560]
+    //   DeepSeek-V4-Flash   256 experts,  6 active, gate/up [4096 -> 2048], down [2048 -> 4096]
+    for (int64_t n : { 1, 4, 31, 32, 64 }) {
+        // gate/up: k is 2560 / 4096, so every type is block-legal here
+        for (ggml_type ta : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4,
+                              GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256,  6, false, 2048, n, 4096));
+        }
+
+        // down: k is 640 on qwen4exp and 640 % 256 != 0, so only 32-block types are legal there.
+        // That constraint is what forces MXFP4/Q4_0/IQ4_NL onto that tensor in the real models.
+        for (ggml_type ta : { GGML_TYPE_MXFP4, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 256,  6, false, 4096, n, 2048));
+        }
+    }
+
+    // Sparse flash attention prefill: long-KV with a sparse mask (n_kv_max hint).
+    // the vec FA kernel iterates only n_kv_max valid entries per row instead of the full KV.
+    for (int64_t kv : { 2048, 4096, 8192, 16384 }) {
+        for (int64_t n_kv_max : { 256, 512, 640, 1024 }) {
+            for (int64_t nb : { 1, 4, 16, 32 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 32, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, n_kv_max));
+            }
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
