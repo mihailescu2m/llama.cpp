@@ -341,6 +341,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // Model whose tensors this one may borrow when it ships without its own. A "shared" MTP
+        // sidecar omits token_embd (and output) and reads them from the model it drafts for, so
+        // one copy stays in memory instead of two. NULL for every ordinary load.
+        const struct llama_model * tensor_donor;
+
         // SSD streaming of MoE routed expert weights (experts are paged from the GGUF on demand
         // into a per-layer cache of moe_stream_slots experts; requires moe_stream = true)
         uint32_t moe_stream_slots;      // expert cache slots per streamed layer (0 = auto)

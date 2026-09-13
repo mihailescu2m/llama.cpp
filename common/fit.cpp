@@ -200,6 +200,15 @@ static void common_params_fit_impl(
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
 
+    // An MTP sidecar can omit token_embd and borrow it from the model it drafts for, but the fit
+    // runs before that model is loaded. Keep a metadata-only stand-in to resolve the borrow
+    // against: without it the sidecar fails to load and its weights go missing from the budget.
+    struct donor_guard {
+        llama_model * model = nullptr;
+        ~donor_guard() { if (model != nullptr) { llama_model_free(model); } }
+    } donor;
+    bool donor_tried = false;
+
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
     auto add_extra_memory = [&](dmds_t & dmds) {
@@ -218,17 +227,43 @@ static void common_params_fit_impl(
             LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
                 __func__, cparams->n_ctx);
 
+            // metadata only, so this reads the GGUF headers and allocates nothing. Loaded at most
+            // once per fit and reused across context sizes; a sidecar carrying its own token_embd
+            // never consults it.
+            if (extra->mparams->tensor_donor == nullptr && !donor_tried) {
+                donor_tried = true;
+
+                llama_model_params mparams_donor = llama_model_default_params();
+                mparams_donor.no_alloc  = true;
+                mparams_donor.load_mode = LLAMA_LOAD_MODE_NONE;
+
+                donor.model = llama_model_load_from_file(path_model, mparams_donor);
+                if (donor.model == nullptr) {
+                    LOG_WRN("%s: could not load %s to resolve borrowed tensors of the extra model\n",
+                        __func__, path_model);
+                }
+            }
+
+            const llama_model * const donor_prev = extra->mparams->tensor_donor;
+            if (extra->mparams->tensor_donor == nullptr) {
+                extra->mparams->tensor_donor = donor.model;
+            }
+
             dmds_t measured;
             try {
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
+                extra->mparams->tensor_donor = donor_prev;
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
                 n_ctx_extra = cparams->n_ctx;
                 return;
             }
+
+            // never leave the caller's params pointing at a model this function will free
+            extra->mparams->tensor_donor = donor_prev;
 
             dmds_extra = dmds_t(devs.size() + 1);
             dmds_extra.back().mb = measured.back().mb;

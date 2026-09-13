@@ -602,5 +602,22 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
+    if (n_written < K) {
+        // groups [n_written, K) would otherwise keep stale content from earlier batches,
+        // and a rollback that reads them restores a wrong state. clamp them to the
+        // batch-start state (the ring-gathered input s), matching the conv-history clamp:
+        // exact for a rollback of exactly n_seq_tokens, best-effort for anything deeper.
+        ggml_tensor * src_in = ggml_reshape_2d(ctx0, s, D, n_seqs);
+
+        for (int64_t gi = n_written; gi < K; ++gi) {
+            ggml_tensor * dst_g = ggml_view_2d(ctx0, ssm_states_all,
+                D, n_seqs,
+                ssm_states_all->nb[1],
+                ((size_t) gi * mem_size + kv_head) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_in, dst_g));
+        }
+    }
+
     return output;
 }
