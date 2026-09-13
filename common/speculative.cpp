@@ -190,6 +190,9 @@ struct common_speculative_impl {
 
     virtual void reset(llama_seq_id /*seq_id*/) {}
 
+    // adopt the request's sampler for this sequence's proposals (drafters that sample only)
+    virtual void set_sampling(llama_seq_id /*seq_id*/, const common_params_sampling & /*sampling*/, uint32_t /*seed*/) {}
+
     // Restoring draft KV is not enough on its own: an implementation may also carry a boundary
     // hidden state that lives in RAM and is not persisted with it. Returning false here forces a
     // resynchronization instead of drafting from a zeroed or foreign boundary.
@@ -226,12 +229,40 @@ struct common_speculative_impl {
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 };
 
+// Rejection sampling is opt-in per implementation. Exact-match verification accepts a draft token
+// only when it equals the target's own draw; rejection sampling accepts it with probability
+// min(1, p_tgt/q) and on a reject emits a draw from the residual - strictly more acceptances for
+// the same output distribution (Leviathan et al. 2023).
+static bool common_speculative_rejection_env(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
+    bool rejection = false; // propose from a distribution, verify by min(1, p_tgt/q)
+
     common_params_speculative_draft params;
 
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
+
+    // Only rejection proposals are sampled; exact-match drafting takes the mode of whatever
+    // chain is installed. Either chain is rebuilt with the request's seed; the backend pre-cut
+    // (top-k) stays.
+    void set_sampling(llama_seq_id seq_id, const common_params_sampling & sampling, uint32_t seed) override {
+        if (!rejection || seq_id < 0 || (size_t) seq_id >= smpls.size()) {
+            return;
+        }
+        GGML_UNUSED(sampling);
+        // the fixed proposal built at init, reseeded
+        common_params_sampling sp;
+        sp.no_perf  = false;
+        sp.seed     = seed;
+        sp.top_k    = 40;
+        sp.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        smpls[seq_id].reset(common_sampler_init(llama_get_model(this->params.ctx_dft), sp));
+    }
 
     common_speculative_impl_draft_simple(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, n_seq, params.draft.n_max)
@@ -273,11 +304,14 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         //     result->smpl = common_sampler_init(llama_get_model(ctx_dft), params);
         // }
 
+        rejection = common_speculative_rejection_env("LLAMA_SPEC_REJECTION");
+
         smpls.resize(n_seq);
         for (auto & smpl : smpls) {
             common_params_sampling params;
             params.no_perf = false;
-            params.top_k = 10;
+            // a residual needs somewhere to put its mass, so propose from more than the mode
+            params.top_k = rejection ? 40 : 10;
             params.samplers = {
                 COMMON_SAMPLER_TYPE_TOP_K,
             };
@@ -369,7 +403,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                const llama_token id_drawn = common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -381,11 +415,31 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 }
 
                 auto & dp = dparams.at(seq_id);
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                const bool rej = rejection && dp.propose_sampled;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                // add drafted token for each sequence. Exact-match wants the mode; rejection wants
+                // the sampler's own draw - proposing the argmax makes q a point mass and the accept
+                // test min(1, p_tgt/q) degenerates back to exact-match.
+                const llama_token id = rej ? id_drawn : cur_p->data[0].id;
+
+                float p_id = cur_p->data[0].p;
+                if (rej) {
+                    p_id = 0.0f;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].id == id) {
+                            p_id = cur_p->data[k].p;
+                            break;
+                        }
+                    }
+                }
+
+                // Only collect very high-confidence draft tokens. Not under rejection sampling:
+                // dropping a drawn token because q(x) < p_min ends the draft, so every token that
+                // survives is conditioned on q(x) >= p_min. The proposal is then q renormalised
+                // over that set, not q, and verifying with the recorded q uses too small a
+                // denominator in min(1, p_tgt/q) and over-accepts. The accept rule already
+                // declines weak proposals, so the two mechanisms are redundant anyway.
+                if (!rej && p_id < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -397,6 +451,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+
+                if (rej && dp.result_dist) {
+                    dp.result_dist->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                }
 
                 if ((params.n_max <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
@@ -1404,11 +1462,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 };
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+    bool rejection = false; // propose from a distribution, verify by min(1, p_tgt/q)
+
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
+
+    // Only rejection proposals are sampled; exact-match drafting takes the mode of whatever
+    // chain is installed. Either chain is rebuilt with the request's seed; the backend pre-cut
+    // (top-k) stays.
+    void set_sampling(llama_seq_id seq_id, const common_params_sampling & sampling, uint32_t seed) override {
+        if (!rejection || seq_id < 0 || (size_t) seq_id >= smpls.size()) {
+            return;
+        }
+        GGML_UNUSED(sampling);
+        // the fixed proposal built at init, reseeded
+        common_params_sampling sp;
+        sp.no_perf  = false;
+        sp.seed     = seed;
+        sp.top_k    = 40;
+        sp.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        smpls[seq_id].reset(common_sampler_init(llama_get_model(this->params.ctx_dft), sp));
+    }
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
@@ -1474,11 +1551,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
+        rejection = common_speculative_rejection_env("LLAMA_SPEC_MTP_REJECTION");
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            // a residual needs somewhere to put its mass, so propose from more than the mode
+            sparams.top_k    = rejection ? 40 : 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -1488,7 +1568,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                // must match the CPU sampler's width: under rejection the recorded q is the proposal
+            // the verifier divides by, and a narrower backend truncation shrinks the residual's
+            // support for no reason
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(rejection ? 40 : 10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1855,7 +1938,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                const llama_token id_drawn = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1867,11 +1950,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 auto & dp = dparams.at(seq_id);
-                const llama_token id = cur_p->data[0].id;
+                const bool rej = rejection && dp.propose_sampled;
 
-                // only collect very high-confidence draft tokens
-                // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
-                if (cur_p->data[0].p < params.p_min) {
+                // add drafted token for each sequence. Exact-match wants the mode; rejection wants
+                // the sampler's own draw - proposing the argmax makes q a point mass and the accept
+                // test min(1, p_tgt/q) degenerates back to exact-match.
+                const llama_token id = rej ? id_drawn : cur_p->data[0].id;
+
+                float p_id = cur_p->data[0].p;
+                if (rej) {
+                    p_id = 0.0f;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].id == id) {
+                            p_id = cur_p->data[k].p;
+                            break;
+                        }
+                    }
+                }
+
+                // Only collect very high-confidence draft tokens. Not under rejection sampling:
+                // dropping a drawn token because q(x) < p_min ends the draft, so every token that
+                // survives is conditioned on q(x) >= p_min. The proposal is then q renormalised
+                // over that set, not q, and verifying with the recorded q uses too small a
+                // denominator in min(1, p_tgt/q) and over-accepts. The accept rule already
+                // declines weak proposals, so the two mechanisms are redundant anyway.
+                if (!rej && p_id < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1883,6 +1986,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+
+                if (rej && dp.result_dist) {
+                    dp.result_dist->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                }
 
                 const int32_t n_mtp_max = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
                 if (n_mtp_max <= (int) result.size()) {
@@ -1934,6 +2041,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_dist) {
+                    dp.result_dist->clear();
+                }
             }
         }
     }
@@ -3043,6 +3153,16 @@ void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
     }
 }
 
+void common_speculative_set_sampling(common_speculative * spec, llama_seq_id seq_id,
+                                     const common_params_sampling & sampling, uint32_t seed) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->set_sampling(seq_id, sampling, seed);
+    }
+}
+
 std::vector<uint8_t> common_speculative_boundary_get(const common_speculative * spec, llama_seq_id seq_id) {
     if (spec == nullptr) {
         return {};
@@ -3178,6 +3298,13 @@ void common_speculative_draft(common_speculative * spec) {
                 if (dp.n_max > 0) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
+                        if (dp.result_dist) {
+                            if (dp.result_dist->size() == result.size()) {
+                                dp.result_dist->resize(dp.n_max);
+                            } else {
+                                dp.result_dist->clear();
+                            }
+                        }
                         result.resize(dp.n_max);
                     }
                 }

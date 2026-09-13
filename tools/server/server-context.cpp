@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-speculative.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -55,6 +56,67 @@ static common_speculative_output_limits server_output_limits(const common_params
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
+// Rejection (speculative) sampling. Exact-match keeps a draft token only when it equals the
+// target's own draw, which throws away every token the target would also have produced with some
+// probability. Here a token proposed with probability q is kept with probability min(1, p_tgt/q),
+// and a rejected one is replaced by a draw from the normalized residual max(0, p_tgt - q). That
+// pair of rules leaves the output distribution exactly the target's (Leviathan et al. 2023), so
+// this buys acceptance without trading quality.
+// Rejection sampling verifies against the target's post-chain candidate array, which only means what
+// it should for a plain, stateless chain.
+//
+//   temp 0        a greedy target is a point mass: a sampled proposal is almost always rejected, so
+//                 exact match is both cheaper and equivalent.
+//   grammar       the candidates are read after ordinary sampling, so grammar-invalid entries can
+//                 still be present when the target's own draw happened to be valid - the residual
+//                 could then emit a token the grammar forbids.
+//   mirostat,     these mutate state inside apply(). The verifier samples once per draft position and
+//   adaptive-p    discards the draw when it accepts the drafted token instead, which would advance
+//                 that state for tokens never emitted.
+//
+// Anything on this list falls back to exact-match verification, which is always correct.
+static bool rejection_verifier_supported(const common_params_sampling & sp) {
+    return sp.temp > 0.0f
+        && sp.grammar.empty()
+        && sp.mirostat == 0
+        && sp.adaptive_target < 0.0f;
+}
+
+// Sixth condition, and the only one that depends on the context rather than the sampler.
+// A checkpoint replay clears the recorded proposal distributions, restores the target sampler and
+// re-verifies by exact match, which changes decisions rejection sampling has already made. So the
+// context must be able to roll the draft back without one. Worst case is the whole draft:
+// n_rollback = draft.size() + 1 - accepted.size() and accepted.size() >= 1. Decided here, before
+// sampling, because accepted.size() does not exist yet.
+static bool rejection_rollback_safe(common_context_seq_rm_type type, llama_context * ctx, size_t n_draft) {
+    if (type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+        return true;
+    }
+    if (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+        return (size_t) llama_n_rs_seq(ctx) >= n_draft;
+    }
+    return false;   // NO and FULL both reach the draft only through a checkpoint
+}
+
+static std::vector<llama_token> server_sample_and_accept_rejection(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_dist,
+        std::mt19937 & rng) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    return server_speculative_rejection(draft, draft_dist, rng,
+            [&](size_t i) {
+                const llama_token token = common_sampler_sample(smpl, ctx, idxs[i]);
+                return server_speculative_sample{token,
+                        i < draft.size() ? common_sampler_get_candidates(smpl, true) : nullptr};
+            },
+            [&](llama_token token) { common_sampler_accept(smpl, token, true); },
+            [&](llama_token token) { return llama_vocab_is_eog(vocab, token); });
+}
+
 static std::vector<llama_token> server_sample_and_accept_synth(
         common_sampler * smpl,
         llama_context * ctx,
@@ -257,11 +319,14 @@ struct server_slot {
 
     llama_tokens spec_draft;
 
+    // proposal distributions for spec_draft, filled only when rejection sampling is on
+    std::vector<std::vector<llama_token_data>> spec_draft_dist;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
+    std::mt19937 spec_rej_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -418,6 +483,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_dist.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -1965,11 +2031,21 @@ private:
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
 
-            if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
+            // Seed both speculative RNGs from the request, not just the synthetic one: rejection
+            // sampling draws its accept tests from spec_rej_rng, so leaving it on mt19937's default
+            // seed made every request replay one fixed stream and ignored the caller's seed.
+            if (spec) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                     ? std::random_device{}()
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
+                // Derive, do not reuse: two mt19937 seeded alike emit the same stream, so the accept
+                // draw could track the target sampler's own uniform and the min(1, p/q) test would
+                // stop being independent of what the target drew. A CPU reproduction put a
+                // conditional at 8.1% where independent streams give 19.95%.
+                slot.spec_rej_rng.seed(seed ^ 0x9e3779b97f4a7c15ULL);
+                // the drafter's own draw is a third stream, distinct from both of the above
+                common_speculative_set_sampling(spec.get(), slot.id, task.params.sampling, seed ^ 0x85ebca6bu);
             }
         } else {
             slot.smpl.reset();
@@ -3206,7 +3282,10 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .result_dist = */ &slot.spec_draft_dist,
                         };
+                        common_speculative_get_draft_params(spec.get(), slot.id).propose_sampled =
+                                rejection_verifier_supported(slot.task->params.sampling);
 
                         drafting.push_back(&slot);
                     }
@@ -4191,6 +4270,16 @@ private:
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (slot.spec_draft_dist.size() == slot.spec_draft.size() &&
+                           slot.task && rejection_verifier_supported(slot.task->params.sampling) &&
+                           rejection_rollback_safe(ctx_tgt_seq_rm_type, slot.ctx_tgt, slot.spec_draft.size())) {
+                    // the drafter recorded what each token was proposed from, so the draft can be
+                    // verified by min(1, p_tgt/q) instead of by equality with the target's draw.
+                    // A greedy target is a point mass: nothing a sampled proposal can be credited
+                    // for, and rejecting it would only cost a token, so exact match wins there.
+                    accepted = server_sample_and_accept_rejection(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.spec_draft_dist, slot.spec_rej_rng);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
@@ -4214,6 +4303,7 @@ private:
 
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_draft_dist.clear();
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -4244,6 +4334,7 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_draft_dist.clear();
             }
 
             const auto ids = std::move(slot.spec_draft);

@@ -69,12 +69,28 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // Per drafted token, the (truncated, renormalized) distribution it was proposed from, parallel
+    // to *result. Rejection sampling needs q to form min(1, p_tgt/q) and the residual; left null
+    // for exact-match verification, in which case nothing is recorded.
+    std::vector<std::vector<llama_token_data>> * result_dist = nullptr;
+
+    // Whether this sequence's drafts will be verified by rejection sampling. When the verifier
+    // falls back to exact match (greedy, grammar, stateful samplers), a drafter configured for
+    // rejection proposes the mode instead of a random draw, which exact match would mostly reject.
+    bool propose_sampled = true;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
 // reset per-sequence carry state before rebuilding a draft context from an uncached prompt
 void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
+
+// Per-request sampling for a drafter that samples its proposals (rejection sampling). seed seeds
+// the drafter's own draw, so sampled runs are reproducible; it must differ from the target's and
+// the verifier's streams. The proposal stays the fixed top-40 chain.
+void common_speculative_set_sampling(common_speculative * spec, llama_seq_id seq_id,
+                                     const common_params_sampling & sampling, uint32_t seed);
 
 // whether a restored target context must be reprocessed to resynchronize the draft state
 // false when every implementation derives its drafts from the prompt alone (ngram)
