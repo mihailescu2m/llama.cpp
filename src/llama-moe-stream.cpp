@@ -2014,6 +2014,96 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     mgr->stats.t_remap_op_us += ggml_time_us() - t_op0;
 }
 
+void llama_moe_stream::register_hash_router(int32_t il, ggml_tensor * tid2eid, uint32_t n_expert_used) {
+    llama_moe_stream_layer * sl = layer(il);
+    if (sl == nullptr || tid2eid == nullptr || n_expert_used == 0) {
+        return;
+    }
+    for (const auto & hr : hash_routers) {
+        if (hr.sl == sl) {
+            return;
+        }
+    }
+    hash_routers.push_back({ sl, tid2eid, {} });
+    hash_n_used = n_expert_used;
+}
+
+void llama_moe_stream_prefetch_hash(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    auto * mgr = (llama_moe_stream *) userdata;
+
+    if (dst->data != a->data) {
+        memcpy(dst->data, a->data, ggml_nbytes(a));
+    }
+
+    const int64_t   n_tokens = ggml_nelements(a);
+    const int32_t * tokens   = (const int32_t *) a->data;
+
+    // the tid2eid tables are model weights, so read them once - outside the lock, since a
+    // cross-backend get can be slow
+    for (auto & hr : mgr->hash_routers) {
+        if (hr.rows.empty()) {
+            hr.rows.resize(ggml_nelements(hr.map));
+            ggml_backend_tensor_get(hr.map, hr.rows.data(), 0, ggml_nbytes(hr.map));
+        }
+    }
+
+    std::unique_lock<std::mutex> lk(mgr->mtx);
+    if (mgr->load_failed) {
+        return;
+    }
+    mgr->start_workers_locked();
+
+    std::vector<int32_t> want;
+    for (auto & hr : mgr->hash_routers) {
+        auto & sl = *hr.sl;
+
+        want.clear();
+        for (int64_t t = 0; t < n_tokens; t++) {
+            const int64_t tok = tokens[t];
+            const int64_t off = tok*mgr->hash_n_used;
+            if (tok < 0 || off + mgr->hash_n_used > (int64_t) hr.rows.size()) {
+                continue;
+            }
+            for (uint32_t k = 0; k < mgr->hash_n_used; k++) {
+                const int32_t e = hr.rows[off + k];
+                if (e >= 0 && (uint32_t) e < sl.n_expert && sl.expert_slot.find(e) == sl.expert_slot.end()) {
+                    want.push_back(e);
+                }
+            }
+        }
+        std::sort(want.begin(), want.end());
+        want.erase(std::unique(want.begin(), want.end()), want.end());
+
+        // A prefill ubatch touches far more experts than the cache holds, and prefetching them all
+        // would evict what it just loaded. Leave those to the wave planner, which orders them.
+        if (want.size() > sl.n_slots/2) {
+            continue;
+        }
+
+        for (const int32_t e : want) {
+            if (sl.expert_slot.find(e) != sl.expert_slot.end()) {
+                continue; // reserved by an earlier token of this same ubatch
+            }
+            const int32_t v = mgr->pick_victim_locked(sl, nullptr);
+            if (v < 0) {
+                break; // every slot busy; the layer's own remap will demand-load it
+            }
+            mgr->reserve_slot_locked(sl, e, v);
+            sl.slot_pending[v] = (uint8_t) sl.weights.size();
+            for (size_t wi = 0; wi < sl.weights.size(); wi++) {
+                mgr->q_spec.push_back({ &sl, e, v, (int32_t) wi, sl.slot_gen[v], mgr->allocation_epoch });
+                mgr->cv_work.notify_one();
+            }
+            mgr->stats.n_preload_issued++;
+        }
+    }
+}
+
 // Prefetch next-layer experts without another graph split. Wrong guesses consume
 // read bandwidth and can evict useful residents, so the candidate budget is bounded.
 static void llama_moe_stream_prefetch_next(llama_moe_stream_lookahead * la, const float * logits, uint32_t rows) {

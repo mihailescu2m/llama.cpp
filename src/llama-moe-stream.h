@@ -167,6 +167,20 @@ struct llama_moe_stream_layer {
     std::unique_ptr<llama_moe_stream_lookahead> la;
 };
 
+// A layer whose expert choice is a token-id lookup instead of a router matmul (deepseek4 sets
+// hash_layer_count = 3). Routing there is known before the graph runs, so the loads can be issued at
+// the top of the pass rather than at the layer.
+//
+// Worth its own path because the miss load is wildly uneven: measured at cache 40, layers 0-2 are 3
+// of 43 layers but 36% of steady-state decode misses, and their share GROWS as the cache warms
+// (14% -> 36% over 200 tokens). They hash the token id, so they gain no locality - 237 distinct
+// experts touched over 200 tokens against 113 slots - while the learned-router layers settle.
+struct llama_moe_stream_hash_router {
+    llama_moe_stream_layer * sl  = nullptr;
+    ggml_tensor *            map = nullptr; // tid2eid {n_expert_used, n_vocab}, I32
+    std::vector<int32_t>     rows;          // host copy of map, filled on first use
+};
+
 // one queued expert load
 struct llama_moe_stream_work {
     llama_moe_stream_layer * sl = nullptr;
@@ -223,6 +237,12 @@ struct llama_moe_stream {
     llama_moe_stream_layer * layer(int32_t il) const {
         return il >= 0 && (size_t) il < layers.size() ? layers[il].get() : nullptr;
     }
+
+    std::vector<llama_moe_stream_hash_router> hash_routers;
+    uint32_t hash_n_used = 0; // n_expert_used, the row stride of every tid2eid
+
+    // idempotent; called at graph build, which is the first point the tensor pointer is known
+    void register_hash_router(int32_t il, ggml_tensor * tid2eid, uint32_t n_expert_used);
 
     // registers a streamed weight of layer il and returns its cache tensor
     ggml_tensor * create_cache_tensor(
@@ -437,6 +457,11 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 // this layer's router input (src b, f32 [n_embd] already multiplied by the next layer's gate_inp,
 // i.e. b holds the next layer's predicted logits). userdata is a llama_moe_stream_lookahead.
 void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
+
+// Identity on the ubatch token ids, with a side effect: start the loads for every hash-routed
+// layer. The hash layers take their tid2eid get_rows index from this op's output, which is what
+// orders it before layer 0. Never waits.
+void llama_moe_stream_prefetch_hash(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids
