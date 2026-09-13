@@ -1098,11 +1098,15 @@ static void moe_stream_reset_plans(llama_moe_stream_layer & sl) {
     sl.plan_capacity  = 0;
     sl.plan_n_waves   = 0;
     sl.plan_next_wave = -1;
+    sl.plan_pair_chunk = 0;
+    sl.plan_waves_want = 0;
     sl.expert_wave.clear();
     sl.plan_pool.clear();
     sl.pool_used.clear();
     sl.wave_first.clear();
     sl.wave_count.clear();
+    sl.plan_pair.clear();
+    sl.pair_count.clear();
 }
 
 static bool moe_stream_can_release(ggml_backend_buffer_t buf) {
@@ -1772,6 +1776,18 @@ void llama_moe_stream::maybe_dump_stats_locked() {
                            "page-cache L2 %4.1f%%\n",
                     __func__, hist, d_sl > 0 ? 100.0*fast/d_sl : 0.0);
         }
+
+        if (stats.chunk_util_max > 0) {
+            LLAMA_LOG_WARN("%s: moe stream: chunk utilisation worst = %" PRId64 "%% (100%% = abort)\n",
+                    __func__, stats.chunk_util_max);
+        }
+
+        if (stats.pair_over_max > 0) {
+            // running maximum, not a delta: it sizes the graph's chunk slack, so what matters is the
+            // worst case the run has produced so far, not the worst in this particular window
+            LLAMA_LOG_WARN("%s: moe stream: pair imbalance worst = +%" PRId64 "%% over mean\n",
+                    __func__, stats.pair_over_max);
+        }
     }
 
     stats_t_last_us = now;
@@ -1995,6 +2011,14 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
     return wave_ud[wave].get();
 }
 
+bool moe_stream_partition() {
+    static const bool v = [] {
+        const char * s = std::getenv("LLAMA_MOE_STREAM_PARTITION");
+        return s == nullptr || atoi(s) != 0; // on by default; an EMPTY value must mean off, not on
+    }();
+    return v;
+}
+
 // wave 0 of a ubatch: record the distinct touched experts (sl.uniq, first-use order) and split them
 // into consecutive groups of plan_capacity, one group per wave (sl.expert_wave[e] = e's wave)
 void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
@@ -2023,7 +2047,16 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
     sl.plan_n_waves   = (uint32_t) ((sl.uniq.size() + sl.plan_capacity - 1)/sl.plan_capacity);
     sl.plan_next_wave = 0;
 
+    // Wave slices. The masked path packs uniq into full groups of plan_capacity, which is what it has
+    // always done. The partition path CANNOT: the graph sized its pair chunk from the wave count it
+    // built, so the planner has to produce exactly that many waves. A ubatch touching few experts
+    // otherwise plans fewer, fatter waves than the graph expects, and each then holds more pairs than
+    // the chunk allows - a repetitive prompt planned 2 waves against a graph built for 5, putting
+    // n_pairs/2 = 1536 pairs into a chunk of 1127. No balancing can fix a wave-count disagreement.
     const size_t n_uniq = sl.uniq.size();
+    if (sl.plan_waves_want > 1 && n_uniq >= sl.plan_waves_want) {
+        sl.plan_n_waves = sl.plan_waves_want;
+    }
     sl.wave_first.assign(sl.plan_n_waves, 0);
     sl.wave_count.assign(sl.plan_n_waves, 0);
     {
@@ -2044,6 +2077,237 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
             }
         }
     }
+
+    // keyed off the chunk the graph set, NOT off the env var: a ubatch too small to partition falls
+    // back to the masked path, and planning pairs for it would check against a stale chunk
+    if (sl.plan_pair_chunk > 0) {
+        plan_pairs_locked(sl, ids, n);
+    }
+}
+
+// Pair partitioning: give every (token, expert) pair to exactly one wave, so the expert GEMMs cover
+// each pair once instead of once per wave. Called after the expert->wave split above, which it
+// REORDERS: stage_wave_locked stages uniq[w*cap .. +cap], so keeping the waves as contiguous runs of
+// uniq means the staging and preload paths need no changes at all - only the order within uniq moves.
+//
+// Why reorder: the graph fixes chunk_pairs before the router has run, so an unbalanced split (some
+// waves owning far more pairs than others, since routing is skewed) would force chunk_pairs up to the
+// worst case and give back the saving. Balancing the pair count across waves bounds it near the mean.
+void llama_moe_stream::plan_pairs_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
+    const uint32_t n_waves = sl.plan_n_waves;
+    if (n_waves <= 1) {
+        sl.plan_pair.clear();
+        return;
+    }
+
+    // pairs per expert - the weight each expert contributes to its wave
+    sl.pair_count.assign(sl.n_expert, 0);
+    for (int64_t i = 0; i < n; i++) {
+        sl.pair_count[ids[i]]++;
+    }
+
+    // group sizes must match what stage_wave_locked will slice out of uniq: cap for every wave but
+    // the last, which takes the remainder
+    std::vector<uint32_t> room(sl.wave_count);
+
+    // heaviest expert first into the currently lightest wave that still has room (LPT scheduling):
+    // bounds the max wave load near the mean for skewed routing, which is what caps chunk_pairs
+    std::vector<int32_t> order(sl.uniq);
+    std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+        return sl.pair_count[a] > sl.pair_count[b];
+    });
+
+    // SNAKE order, not greedy-lightest. Each wave must end up with a fixed NUMBER of experts (its
+    // staging slice), and that cardinality constraint fights load balance: sending each expert to the
+    // lightest wave fills the light waves' expert slots first, after which every remaining expert is
+    // forced into whatever wave still has room regardless of its load. With 256 experts over 5 waves
+    // of 52 there is almost no spare capacity, so that is forced rather than unlucky - it piled 1667
+    // pairs into one wave against a mean of 615, all of them individually small.
+    //
+    // Sweeping back and forth (rank 0->wave 0, 1->1, .. k-1->k-1, k->k-1, k+1->k-2, ..) pairs each
+    // heavy expert with a light one and fills every wave to exactly its room by construction.
+    std::vector<std::vector<int32_t>> group(n_waves);
+    std::vector<int64_t>              load (n_waves, 0);
+    {
+        std::vector<uint32_t> left(room);
+        std::vector<uint32_t> seq;
+        seq.reserve(order.size());
+
+        uint32_t w = 0;
+        int      dir = 1;
+        while (seq.size() < order.size()) {
+            if (left[w] > 0) {
+                seq.push_back(w);
+                left[w]--;
+            }
+            if (dir > 0) {
+                if (w + 1 < n_waves) { w++; } else { dir = -1; }
+            } else {
+                if (w > 0) { w--; } else { dir = 1; }
+            }
+        }
+        for (size_t i = 0; i < order.size(); i++) {
+            group[seq[i]].push_back(order[i]);
+            load [seq[i]] += sl.pair_count[order[i]];
+        }
+    }
+
+    // Repair pass: swapping a heavy expert out of the worst wave for a lighter one from the best wave
+    // preserves both cardinalities, so it can only help. Only runs when a wave is actually over the
+    // chunk, which snake ordering already makes rare.
+    for (int iter = 0; iter < 64; iter++) {
+        uint32_t hi = 0, lo = 0;
+        for (uint32_t w = 1; w < n_waves; w++) {
+            if (load[w] > load[hi]) { hi = w; }
+            if (load[w] < load[lo]) { lo = w; }
+        }
+        if (load[hi] <= (int64_t) sl.plan_pair_chunk || hi == lo) {
+            break;
+        }
+
+        // best swap = the one that shrinks the gap most without inverting it
+        const int64_t gap = load[hi] - load[lo];
+        int64_t best_d = 0;
+        size_t  bi = 0, bj = 0;
+        for (size_t i = 0; i < group[hi].size(); i++) {
+            for (size_t j = 0; j < group[lo].size(); j++) {
+                const int64_t d = sl.pair_count[group[hi][i]] - sl.pair_count[group[lo][j]];
+                if (d > best_d && 2*d <= gap + best_d) { best_d = d; bi = i; bj = j; }
+            }
+        }
+        if (best_d <= 0) {
+            break; // nothing left to trade
+        }
+        std::swap(group[hi][bi], group[lo][bj]);
+        load[hi] -= best_d;
+        load[lo] += best_d;
+    }
+
+    // rewrite uniq in wave order and record each wave's slice, so the stager needs no change
+    sl.uniq.clear();
+    for (uint32_t w = 0; w < n_waves; w++) {
+        sl.wave_first[w] = (uint32_t) sl.uniq.size();
+        sl.wave_count[w] = (uint32_t) group[w].size();
+        for (const int32_t e : group[w]) {
+            sl.expert_wave[e] = (uint8_t) w;
+            sl.uniq.push_back(e);
+        }
+    }
+
+    // how far the worst wave sits above the mean - what the graph's chunk slack has to cover
+    const int64_t mean = (int64_t) n/n_waves;
+    for (uint32_t w = 0; w < n_waves; w++) {
+        stats.pair_over_max = std::max(stats.pair_over_max, mean > 0 ? (load[w] - mean)*100/mean : 0);
+    }
+
+    // CHUNK UTILISATION: the worst wave load as a percentage of the bound that ABORTS when exceeded.
+    // This is the number that predicts a crash; imbalance-over-mean does not, because the chunk is
+    // floored at n_tokens and so is not a fixed multiple of the mean. 100% means the server died.
+    int64_t worst = 0;
+    for (uint32_t w = 0; w < n_waves; w++) worst = std::max(worst, load[w]);
+    if (sl.plan_pair_chunk > 0) {
+        stats.chunk_util_max = std::max(stats.chunk_util_max, worst*100/(int64_t) sl.plan_pair_chunk);
+    }
+
+    // flat pair indices (t*n_ids + k) owned by each wave
+    sl.plan_pair.assign(n_waves, {});
+    for (uint32_t w = 0; w < n_waves; w++) {
+        sl.plan_pair[w].reserve((size_t) load[w]);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        sl.plan_pair[sl.expert_wave[ids[i]]].push_back((int32_t) i);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SPLIT PASS: move surplus pairs off any over-full wave, staging that expert in the receiving
+    // wave as well.
+    //
+    // Balancing alone cannot fix this, because all of an expert's pairs go wherever it is staged. A
+    // single expert can hold n_tokens pairs (one per token), so even with the chunk floored at
+    // n_tokens, that expert PLUS any other in the same wave overflows. Measured: an 800-word
+    // repetitive prompt gave "wave 0 holds 1009 pairs but chunk is 1000" - overflowing by the size
+    // of the second expert. Repetitive input reaches this trivially, so it is not a corner case.
+    //
+    // A distribution always exists: total capacity is n_waves*chunk, which exceeds n_pairs by the
+    // slack. Only indivisibility stood in the way, and an expert may be staged in more than one wave
+    // - it costs a slot there, and a second staging of a resident expert is a cache hit, not I/O.
+    // ---------------------------------------------------------------------------------------------
+    const size_t chunk = sl.plan_pair_chunk;
+    for (uint32_t w = 0; w < n_waves && chunk > 0; w++) {
+        while (sl.plan_pair[w].size() > chunk) {
+            const size_t surplus = sl.plan_pair[w].size() - chunk;
+
+            // the expert contributing most to this wave is the one worth moving
+            std::unordered_map<int32_t, size_t> cnt;
+            for (const int32_t idx : sl.plan_pair[w]) cnt[ids[idx]]++;
+            int32_t hot = -1; size_t hot_n = 0;
+            for (const auto & kv : cnt) if (kv.second > hot_n) { hot = kv.first; hot_n = kv.second; }
+            if (hot < 0) break;
+
+            // A receiving wave always needs pair room. It needs a free expert slot only if it does
+            // not already stage `hot` - if it does, the pairs land on a slot that wave has already
+            // reserved, so the move is free. Preferring those receivers is what the earlier version
+            // had backwards: it SKIPPED them, spending a slot where none was needed.
+            int32_t dst = -1; size_t room = 0; bool dst_has = false;
+            for (uint32_t v = 0; v < n_waves; v++) {
+                if (v == w || sl.plan_pair[v].size() >= chunk) continue;
+
+                const bool has = std::find(group[v].begin(), group[v].end(), hot) != group[v].end();
+                if (!has && group[v].size() >= sl.plan_capacity) continue;
+
+                // a free move beats a bigger one that costs a slot
+                const size_t r = chunk - sl.plan_pair[v].size();
+                if (has != dst_has ? has : r > room) { room = r; dst = (int32_t) v; dst_has = has; }
+            }
+            if (dst < 0) {
+                break; // no receiver; the check below reports it rather than truncating silently
+            }
+
+            const size_t move = std::min({surplus, room, hot_n});
+            std::vector<int32_t> keep; keep.reserve(sl.plan_pair[w].size() - move);
+            size_t moved = 0;
+            for (const int32_t idx : sl.plan_pair[w]) {
+                if (moved < move && ids[idx] == hot) { sl.plan_pair[dst].push_back(idx); moved++; }
+                else                                  { keep.push_back(idx); }
+            }
+            sl.plan_pair[w].swap(keep);
+            if (!dst_has) {
+                group[dst].push_back(hot);   // stage it in the receiver too
+            }
+            stats.n_pair_splits++;
+            if (moved == 0) break;
+        }
+    }
+
+    // uniq must reflect the split staging, so rebuild the slices from the (possibly grown) groups.
+    // expert_wave is left as the last writer sets it: the partition path keys off plan_pair, not
+    // expert_wave, and the masked path never runs when partitioning is active.
+    sl.uniq.clear();
+    for (uint32_t w = 0; w < n_waves; w++) {
+        sl.wave_first[w] = (uint32_t) sl.uniq.size();
+        sl.wave_count[w] = (uint32_t) group[w].size();
+        for (const int32_t e : group[w]) sl.uniq.push_back(e);
+    }
+
+    // still loud if a wave cannot be represented - but this should now be unreachable
+    for (uint32_t w = 0; w < n_waves; w++) {
+        if (sl.plan_pair[w].size() > sl.plan_pair_chunk) {
+            // Report which constraint bound, because the two have different fixes: no pair room
+            // means the chunk itself is too small (raise LLAMA_MOE_STREAM_PAIR_SLACK), no slot room
+            // means the wave count is too low for the expert count (the cap-1 sizing in
+            // llama-graph.cpp did not apply, e.g. the pairs-per-wave floor blocked it).
+            size_t free_pairs = 0, free_slots = 0;
+            for (uint32_t v = 0; v < n_waves; v++) {
+                free_pairs += sl.plan_pair[v].size()   < chunk            ? 1 : 0;
+                free_slots += group[v].size() < (size_t) sl.plan_capacity ? 1 : 0;
+            }
+            GGML_ABORT("MoE expert streaming: wave %u holds %zu pairs but chunk is %u after splitting "
+                       "(%u waves, %zu with pair room, %zu with a free expert slot, capacity %u, "
+                       "%zu experts staged); report it with the prompt that caused it",
+                    w, sl.plan_pair[w].size(), sl.plan_pair_chunk,
+                    n_waves, free_pairs, free_slots, sl.plan_capacity, sl.uniq.size());
+        }
+    }
 }
 
 // make wave w's expert slice (uniq[wave_first[w] .. +wave_count[w])) resident, waiting for its loads,
@@ -2051,7 +2315,8 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
 // sl.demand_slots = this wave's slots and sl.plan_pool = the resident parking pool (>= n_ids slots)
 // the emit draws masked pairs from
 void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids) {
-    // wave w's slice of uniq, as plan_waves_locked split it
+    // the slices come from plan_waves_locked rather than being w*plan_capacity: the partition path
+    // needs exactly as many waves as the graph built, which may be more than uniq/plan_capacity
     const size_t first = (size_t) w < sl.wave_first.size() ? sl.wave_first[w] : sl.uniq.size();
     const size_t count = (size_t) w < sl.wave_count.size() ? sl.wave_count[w] : 0;
 
@@ -2244,7 +2509,93 @@ void llama_moe_stream::emit_wave_slots(llama_moe_stream_layer & sl, const int32_
     }
 }
 
-// Preamble of the wave ids op: plan the whole ubatch on wave 0, enforce that the waves run in
+// Padding may carry slot -1 when every expert cache is a Metal buffer: the Metal mul_mm_id map0 drops an
+// id that matches no slot, so the GEMMs spend no tiles on it and leave its rows unwritten, and those rows
+// scatter to the scratch row. Other backends index weights by the id directly, so they keep the repeats.
+bool llama_moe_stream::pad_skip_ok() {
+    if (pad_skip < 0) {
+        const char * e = getenv("LLAMA_MOE_STREAM_PAD_SKIP");
+        bool ok = !(e && atoi(e) == 0);
+        bool any = false;
+        for (const auto & group : cache_bufs) {
+            if (!group.buf) {
+                continue;
+            }
+            any = true;
+#ifdef GGML_USE_METAL
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(group.buf.get()));
+            ok = ok && dev != nullptr && ggml_backend_dev_backend_reg(dev) == ggml_backend_metal_reg();
+#else
+            ok = false;
+#endif
+        }
+        pad_skip = ok && any ? 1 : 0;
+    }
+    return pad_skip > 0;
+}
+
+// Partition path: write the index rows describing wave w's dense pair list. Every (token, expert)
+// pair belongs to exactly one wave, so across the waves each pair is emitted once and the GEMM covers
+// it once - as opposed to emit_wave_slots above, where every wave covers every pair and masks the rest.
+//
+// The list is padded to the static chunk by REPEATING this wave's last pair: the GEMM then recomputes
+// that pair and the scatter writes the same value to the same row, so padding needs neither a scratch
+// row nor zero-initialised output.
+// On Metal the padding instead carries slot -1 and goes to the scratch row (see pad_skip_ok).
+//
+// A wave can also own nothing at all - the graph fixes the wave count from the worst case (every expert
+// touched), so a ubatch that touches fewer leaves the late waves empty. Such a wave has no pair it may
+// legitimately write, and cannot borrow one either: another wave's expert is not necessarily still
+// resident by the time this one runs. It therefore computes a throwaway row on a parked slot and
+// scatters it to the scratch row past the end of the real pairs, which nothing reads.
+void llama_moe_stream::emit_wave_pairs(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out,
+        int32_t w, uint32_t n_ids, int64_t n_pairs, int64_t chunk) {
+    const std::vector<int32_t> * pairs = (size_t) w < sl.plan_pair.size() ? &sl.plan_pair[w] : nullptr;
+    if (pairs != nullptr && pairs->empty()) {
+        pairs = nullptr;
+    }
+    GGML_ASSERT(pairs == nullptr || (int64_t) pairs->size() <= chunk);
+
+    int32_t * r_tok  = out + LLAMA_MOE_PAIR_TOK *chunk;
+    int32_t * r_pair = out + LLAMA_MOE_PAIR_PAIR*chunk;
+    int32_t * r_slot = out + LLAMA_MOE_PAIR_SLOT*chunk;
+    int32_t * r_exp  = out + LLAMA_MOE_PAIR_EXP *chunk;
+    int32_t * r_input = out + LLAMA_MOE_PAIR_INPUT*chunk;
+
+    // 32: below it Metal takes the mul_mv_id path, which reads the slot id without a check
+    const bool skip = chunk >= 32 && pad_skip_ok();
+
+    if (pairs == nullptr) {
+        GGML_ASSERT(!sl.plan_pool.empty()); // stage_wave_locked leaves >= n_ids resident parking slots
+        const int32_t s = sl.plan_pool[0];
+        GGML_ASSERT(sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
+        for (int64_t p = 0; p < chunk; p++) {
+            r_tok [p] = 0;
+            r_pair[p] = (int32_t) n_pairs; // scratch row
+            r_input[p] = 0;
+            r_slot[p] = skip ? -1 : s;
+            r_exp [p] = sl.slot_expert[s];
+        }
+        return;
+    }
+
+    for (int64_t p = 0; p < chunk; p++) {
+        const bool pad = p >= (int64_t) pairs->size();
+        const int32_t i = (*pairs)[pad ? pairs->size() - 1 : (size_t) p];
+        const int32_t e = ids[i];
+        const int32_t s = sl.expert_slot.at(e);
+        GGML_ASSERT(sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
+        sl.slot_last_use[s] = ++sl.use_counter;
+
+        r_tok [p] = i/(int32_t) n_ids;
+        r_pair[p] = pad && skip ? (int32_t) n_pairs : i;
+        r_input[p] = i;
+        r_slot[p] = pad && skip ? -1 : s;
+        r_exp [p] = e;
+    }
+}
+
+// Shared preamble of the two wave ops: plan the whole ubatch on wave 0, enforce that the waves run in
 // order, and make wave w's expert slice resident while preloading the next. Returns with the manager
 // mutex still held, because the emit that follows reads the slot table this just settled.
 static std::unique_lock<std::mutex> stage_wave_for_op(llama_moe_stream_layer & sl, int32_t w,
@@ -2304,6 +2655,42 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     std::unique_lock<std::mutex> lk = stage_wave_for_op(*sl, w, ids, n, (uint32_t) a->ne[0]);
 
     mgr->emit_wave_slots(*sl, ids, out, w, (uint32_t) a->ne[0], a->ne[1]);
+
+    mgr->stats.t_wave_op_us += ggml_time_us() - t_op0;
+}
+
+// Partition path (LLAMA_MOE_STREAM_PARTITION=1) counterpart of llama_moe_stream_wave_ids: identical
+// staging, but instead of slot ids for every pair it emits the index rows of wave w's own pairs, which
+// build_moe_ffn gathers into a dense GEMM and scatters back. No mask op is needed - a pair is computed
+// by the one wave that owns it, so there is nothing to discard.
+void llama_moe_stream_wave_pairs(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    const int64_t t_op0 = ggml_time_us();
+
+    auto * ud  = (llama_moe_stream_wave *) userdata;
+    auto * sl  = ud->sl;
+    auto * mgr = sl->mgr;
+
+    const int32_t w = ud->wave;
+
+    const ggml_tensor * a = dst->src[0]; // contiguous selected ids
+    GGML_ASSERT(a->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->ne[1] == LLAMA_MOE_PAIR_ROWS);
+
+    const int64_t   n   = ggml_nelements(a);
+    const int32_t * ids = (const int32_t *) a->data;
+          int32_t * out = (int32_t *) dst->data;
+
+    std::unique_lock<std::mutex> lk = stage_wave_for_op(*sl, w, ids, n, (uint32_t) a->ne[0]);
+
+    mgr->emit_wave_pairs(*sl, ids, out, w, (uint32_t) a->ne[0], n, dst->ne[0]);
 
     mgr->stats.t_wave_op_us += ggml_time_us() - t_op0;
 }

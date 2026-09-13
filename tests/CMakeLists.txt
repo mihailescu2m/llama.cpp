@@ -150,6 +150,7 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
+llama_build_and_test(test-moe-wave.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     if (TARGET ggml-metal)

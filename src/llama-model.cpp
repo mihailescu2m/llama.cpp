@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-moe-stream.h"
+#include "llama-moe-wave.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1494,7 +1495,7 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
     }
 
     if (n_slots == 0) {
-        n_slots = std::clamp<uint32_t>(2*hparams.n_expert_used_max(), 16, hparams.n_expert);
+        n_slots = llama_moe_stream_default_slots(hparams.n_expert, hparams.n_expert_used_max());
     }
 
     if (n_slots >= hparams.n_expert) {

@@ -1442,7 +1442,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::exception & err) {
+            // an unusable configuration (e.g. an expert cache too small to stage prefill waves)
+            // fails this ubatch; the caller reports it instead of aborting the server
+            LLAMA_LOG_ERROR("%s: failed to build the graph: %s\n", __func__, err.what());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2553,7 +2561,15 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
-    auto * gf = model.build_graph(gparams);
+    ggml_cgraph * gf = nullptr;
+    try {
+        gf = model.build_graph(gparams);
+    } catch (const std::exception & err) {
+        // same as in process_ubatch: report the configuration error, do not abort
+        LLAMA_LOG_ERROR("%s: failed to build the graph: %s\n", __func__, err.what());
+        this->n_outputs = save_n_outputs;
+        return nullptr;
+    }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
