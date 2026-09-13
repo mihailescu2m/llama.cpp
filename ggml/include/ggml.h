@@ -601,6 +601,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_UNION_BUILD,
+        GGML_OP_FLASH_ATTN_UNION,
+
         GGML_OP_COUNT,
     };
 
@@ -2459,6 +2462,33 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // union-8 support: dedup the top-k selections of a BLOCK of queries into one shared list.
+    // sel is I32 [n_sel, n_tokens]; the result is I32 [max_union + 1, n_blocks] where each entry
+    // packs the pooled row id in the low 24 bits and an 8-bit membership mask in the high byte
+    // (bit q set = query q of this block selected that row). The last element of each block row
+    // holds the union length. Blocks are ceil(n_tokens/block).
+    // union-8 attention: q attends the contiguous prefix [0, n_dense) plus, for its block, only
+    // the union entries whose membership bit is set. uids comes from ggml_union_build.
+    GGML_API struct ggml_tensor * ggml_flash_attn_union(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * uids,
+            int                   n_dense,
+            float                 scale);
+
+    // union entries also take the mask, at column n_dense + id: for selections that may name masked
+    // cells (e.g. the causal tail of a selected block). The mask must span every K row.
+    GGML_API void ggml_flash_attn_union_mask_all(struct ggml_tensor * a);
+
+    GGML_API struct ggml_tensor * ggml_union_build(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sel,
+            int                   n_csa,
+            int                   block);
 
     // top k elements per row
     // note: the resulting top k indices are in no particular order

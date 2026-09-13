@@ -155,6 +155,7 @@ llama_build_and_test(test-top-k-determinism.cpp)
 llama_build_and_test(test-top-k-repeat.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-fork-attention.cpp)
     if (TARGET ggml-metal)
         llama_build_and_test(test-metal-cache-resize.cpp)
         target_link_libraries(test-metal-cache-resize PRIVATE ggml-metal)
