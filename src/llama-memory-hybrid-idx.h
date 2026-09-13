@@ -81,14 +81,14 @@ public:
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to; optional for block top-k
     //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
     //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv,
                        bool blk_bias,
                        ggml_tensor * dirty_cells = nullptr,
                        ggml_tensor * dirty_pos   = nullptr,
@@ -183,7 +183,7 @@ public:
     //   dirty_pos   I32 [4*n_dirty_max*ns]      mrope position rows of those blocks
     //   dirty_rows  I64 [n_dirty_max*ns]        pooled-cache rows to write, dustbin-padded
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv,
                        bool blk_bias,
                        ggml_tensor * dirty_cells = nullptr,
                        ggml_tensor * dirty_pos   = nullptr,
@@ -194,6 +194,10 @@ public:
     ggml_tensor * get_pooled_k(int32_t il) const;
 
     uint32_t get_pooled_rows() const;
+
+    // The compact table has room for only one incomplete block. Other layouts
+    // must retain the per-cell selection path (including on graph reuse).
+    bool qsa_block_topk_safe(const llama_ubatch & ubatch) const;
 
     // capacity the dirty tables need for this ubatch: completed blocks plus pending refill
     // below the watermark; stable at 1 during steady decode so graph reuse holds

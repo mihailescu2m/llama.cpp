@@ -42,6 +42,20 @@ static void test_qsa_tables() {
     ub.pos = &pos; ub.seq_id = &seqp; ub.n_seq_id = &ns;
     llama_memory_hybrid_idx_context mctx(&mem);
 
+    // The block-selection table has only one spare block. Two partial sequences
+    // or two partial position blocks must use per-cell selection, not overwrite
+    // each other's live keys in that spare block.
+    cells.reset();
+    for (int i = 0; i < 7; ++i) { cells.pos_set(i, i); cells.seq_add(i, 0); }
+    CHECK(mctx.qsa_block_topk_safe(ub));
+    cells.seq_rm(1, 0); // remove position 1 without removing a whole block
+    CHECK(!mctx.qsa_block_topk_safe(ub));
+    cells.reset();
+    for (int i = 0; i < 6; ++i) {
+        cells.pos_set(i, i % 3); cells.seq_add(i, i / 3);
+    }
+    CHECK(!mctx.qsa_block_topk_safe(ub));
+
     // Contiguous, hole, unified sequences, prefix removal; include cached decode steps.
     for (int scenario = 0; scenario < 4; ++scenario) {
         cells.reset(); mem.pooled_valid(0) = 0; mem.pooled_valid(1) = 0;

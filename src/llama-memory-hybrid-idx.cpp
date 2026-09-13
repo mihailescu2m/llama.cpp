@@ -427,17 +427,23 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
+        int64_t n_kv,
         bool blk_bias,
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows) const {
     GGML_ASSERT(ratio > 0);
+    GGML_ASSERT(n_kv > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
+    GGML_ASSERT(bias != nullptr);
+    // block top-k has no cell_blk and maps its selection through blk_cells instead
+    GGML_ASSERT(cell_blk != nullptr || (blk_bias && blk_cells != nullptr));
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    for (const ggml_tensor * t : { cell_blk, blk_cells, blk_pos, bias }) {
+        GGML_ASSERT(t == nullptr || ggml_backend_buffer_is_host(t->buffer));
+    }
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_ns     = bias->ne[2];            // streams in this ubatch
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
     // same formula as the graph; blk_pos may be null on the pooled path
@@ -446,7 +452,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    GGML_ASSERT(cell_blk  == nullptr || (cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_ns));
+    GGML_ASSERT(blk_cells == nullptr || blk_cells->ne[0] == r*n_blocks);
+    GGML_ASSERT(bias->ne[0] == (blk_bias ? n_blocks : n_kv));
+    GGML_ASSERT(bias->ne[1] == n_tps && bias->ne[2] == n_ns);
+
+    int32_t * dst_cell_blk  = cell_blk == nullptr ? nullptr : (int32_t *) cell_blk->data;
     float   * dst_bias      = (float   *) bias->data;
 
     // [TAG_QSA_POOLED_CACHE] the pooled path drops blk_cells/blk_pos from the graph (the dirty
@@ -485,7 +496,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk == nullptr ? nullptr : dst_cell_blk + s*n_kv;
 
         std::fill(loc_blk_cells.begin(), loc_blk_cells.end(), 0);
         std::fill(loc_blk_pos.begin(),   loc_blk_pos.end(),   0);
@@ -656,6 +667,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const bool     have_dead = n_bid < n_blocks;
         const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
+        // padding in cur_blk_cells is 0, a valid cell id, so the spare block's liveness has to be
+        // recorded while its members are written rather than recovered from the list afterwards
+        int64_t dead_min_idx = INT64_MAX;
+
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
 
@@ -667,7 +682,30 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 loc_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
             }
 
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            // Tracked on BOTH paths: the per-cell path below exits early, and leaving the spare
+            // block's liveness unset there marks it -inf for every query, dropping the newest
+            // tokens from the very fallback used as a control.
+            if (have_dead && blk_of[j] < 0 && !cells.is_empty(j)) {
+                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+
+                dead_min_idx = std::min(dead_min_idx, idx);
+
+                // Block top-k has no cell_blk, so an unpooled cell cannot be routed to the spare
+                // block by per-cell lookup - it has to appear IN that block's member list or it
+                // drops out of the selection entirely, and the unpooled cells are the incomplete
+                // TAIL, i.e. the newest tokens. Place each at its own position slot, exactly as a
+                // full block does. The graph only enables block top-k for a contiguous single
+                // text prefix: at most r-1 unpooled cells, with distinct position slots.
+                // Holes or multiple sequences must instead use the per-cell lookup below.
+                if (cur_cell_blk == nullptr) {
+                    loc_blk_cells[dead_bid*r + (idx%r)] = (int32_t) j;
+                }
+            }
+
+            if (cur_cell_blk != nullptr) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+                continue;
+            }
         }
 
         if (dst_blk_cells != nullptr) {
@@ -794,15 +832,26 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         continue;
                     }
 
+                    // A block starting after the query is entirely future. It must be dropped HERE,
+                    // before top-k: selection ranks on score+bias and knows nothing of causality, so
+                    // a future block that outranks the query's own steals a slot and is then erased
+                    // by the attention mask. With a 4096-token ubatch an early row has ~1023 future
+                    // blocks against 513 slots, and could keep none of its visible ones.
+                    if (bid_idx[b] > q) {
+                        cur_blk_bias[b] = -INFINITY;
+                        continue;
+                    }
+
                     // finite, so it can never meet a -inf and produce a nan
                     cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
                 }
 
-                // the spare block holds the unpooled cells, which are the incomplete tail, so
-                // it gets the tail value. it must stay finite: a sequence with fewer than
-                // `ratio` cells owns no full block, and a row of -inf only gives a nan.
+                // the spare block holds the unpooled cells, which are the incomplete tail. It is
+                // visible only once the query reaches them; before that it is as future as any
+                // other block. The row can never go all -inf: the query's own cell sits either in
+                // a full block (bid_idx <= q) or in this one (dead_min_idx <= q).
                 if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
+                    cur_blk_bias[dead_bid] = dead_min_idx <= q ? 1e9f : -INFINITY;
                 }
 
                 continue;
@@ -916,13 +965,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
+        int64_t n_kv,
         bool blk_bias,
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias,
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, n_kv, blk_bias,
             dirty_cells, dirty_pos, dirty_rows);
 }
 
@@ -932,6 +982,25 @@ ggml_tensor * llama_memory_hybrid_idx_context::get_pooled_k(int32_t il) const {
 
 uint32_t llama_memory_hybrid_idx_context::get_pooled_rows() const {
     return mem != nullptr ? mem->get_pooled_rows() : 0;
+}
+
+bool llama_memory_hybrid_idx_context::qsa_block_topk_safe(const llama_ubatch & ubatch) const {
+    if (!mem || !mem->get_mem_idx() || !ubatch.seq_id || !ubatch.seq_id[0] ||
+            !ubatch.pos || ubatch.is_pos_2d()) {
+        return false;
+    }
+    const auto seq = ubatch.seq_id[0][0];
+    const auto & cells = mem->get_mem_idx()->get_cells(seq);
+    for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+        if (sq != seq && cells.seq_pos_min(sq) >= 0) {
+            return false;
+        }
+    }
+    // A contiguous text prefix has only its final partial block. With holes or
+    // a shifted prefix, several incomplete blocks can collide at idx % ratio
+    // in the table's single spare row, silently dropping live attention keys.
+    return cells.seq_pos_min(seq) == 0 &&
+           (int64_t) cells.seq_pos_max(seq) + 1 == cells.get_used();
 }
 
 uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_ubatch & ubatch, uint32_t ratio) const {
