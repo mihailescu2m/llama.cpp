@@ -5,6 +5,10 @@
 #include "llama-moe-stream.h"
 
 #include <algorithm>
+#if defined(__APPLE__) || defined(__unix__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <cinttypes>
 #include <cstdlib>
 
@@ -1569,6 +1573,55 @@ public:
     std::vector<llama_token> prev;
 };
 
+// The PLE table is lazily mapped (TENSOR_READ_LAZY): in the gather every row is a random page fault,
+// taken a few at a time by the compute threads. Ask for all of a ubatch's row pages up front, so the
+// drive sees the whole step's reads at once. Advisory only: the bytes the gather reads are unchanged.
+// LLAMA_PLE_PREFETCH=0 disables it.
+static bool qwen4exp_ple_prefetch_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_PLE_PREFETCH");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static void qwen4exp_ple_prefetch(const ggml_tensor * table, std::vector<int32_t> rows) {
+#if defined(__APPLE__) || defined(__unix__)
+    if (table == nullptr || table->data == nullptr || table->buffer == nullptr || !ggml_backend_buffer_is_host(table->buffer)) {
+        return;
+    }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t base = (uintptr_t) table->data;
+    const size_t    nb1  = table->nb[1];
+
+    // merge the pages of neighbouring rows into one range
+    uintptr_t cur_b = 0;
+    uintptr_t cur_e = 0;
+    for (const int32_t r : rows) {
+        const uintptr_t b = (base + (size_t) r*nb1) & ~(page - 1);
+        const uintptr_t e = (base + (size_t) (r + 1)*nb1 + page - 1) & ~(page - 1);
+        if (b <= cur_e) {
+            cur_e = std::max(cur_e, e);
+            continue;
+        }
+        if (cur_e > cur_b) {
+            posix_madvise((void *) cur_b, cur_e - cur_b, POSIX_MADV_WILLNEED);
+        }
+        cur_b = b;
+        cur_e = e;
+    }
+    if (cur_e > cur_b) {
+        posix_madvise((void *) cur_b, cur_e - cur_b, POSIX_MADV_WILLNEED);
+    }
+#else
+    GGML_UNUSED(table);
+    GGML_UNUSED(rows);
+#endif
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -1627,6 +1680,10 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
             }
         }
+    }
+
+    if (qwen4exp_ple_prefetch_enabled()) {
+        qwen4exp_ple_prefetch(pmodel.per_layer_tok_embd, idx);
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
