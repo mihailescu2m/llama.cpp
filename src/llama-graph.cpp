@@ -2314,7 +2314,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * ids_cont = ggml_is_contiguous(selected_experts)
             ? selected_experts : ggml_cont(ctx0, selected_experts);
 
-        ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+        // One-layer-ahead prefetch: predict the NEXT layer's routing from THIS layer's router
+        // input and hand it to the same custom op, so the lookahead costs no extra graph split.
+        // The prediction skips the attention and FFN terms between the layers - a lower bound,
+        // but the exact version would need layer L+1's attention output, i.e. attention twice
+        // per layer.
+        if (msl->la && msl->la->sl_next && msl->la_gate_inp) {
+            ggml_tensor * la_logits = ggml_mul_mat(ctx0, msl->la_gate_inp, cur);
+            ggml_prec_set_acc(la_logits, GGML_PREC_F32);
+            cb(la_logits, "ffn_moe_logits_next", il);
+
+            ids_gemm = ggml_map_custom2(ctx0, ids_cont, la_logits, llama_moe_stream_remap_la, 1, msl->la.get());
+        } else {
+            ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+        }
         cb(ids_gemm, "ffn_moe_topk_stream", il);
     }
 

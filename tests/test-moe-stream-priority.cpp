@@ -1,6 +1,7 @@
 // Real worker queues and file reads, with one CPU-buffer upload held at a controlled boundary.
 // This exposes outstanding reads after the demand queue is empty without timing disk latency.
 #include "../src/llama-moe-stream.h"
+#include "../src/llama-moe-lookahead.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpu.h"
 
@@ -222,8 +223,26 @@ static void test_failed_and_stale_reads() {
     CHECK(f.stream->stats.n_slabs_read == 2 && f.stream->stats.n_bytes_read == 0);
 }
 
+static void test_lookahead_select() {
+    const float logits[] = {9, 8, 1, 0,  1, 0, 9, 8};
+    std::vector<float> scratch;
+    std::vector<int32_t> picked;
+    llama_moe_lookahead_select(logits, 4, 2, 2, {}, scratch, picked); // the last row predicts
+    CHECK((picked == std::vector<int32_t>{2, 3}));
+    llama_moe_lookahead_select(logits, 4, 1, 2, {0, 0, 10, 0}, scratch, picked);
+    CHECK((picked == std::vector<int32_t>{2, 0}));
+    const float invalid[] = {1, 0, 9, 8,  NAN, -INFINITY, INFINITY, NAN};
+    llama_moe_lookahead_select(invalid, 4, 2, 4, {}, scratch, picked); // nonfinite scores never qualify
+    CHECK((picked == std::vector<int32_t>{1}));
+    llama_moe_lookahead_select(logits, 4, 2, 0, {}, scratch, picked);
+    CHECK(picked.empty());
+    llama_moe_lookahead_select(logits, 4, 2, 99, {}, scratch, picked); // K clamps to the expert count
+    CHECK(picked.size() == 4);
+}
+
 int main() {
     try {
+        test_lookahead_select();
         test_victim_wait_accounting();
         test_completion();
         test_promotion();

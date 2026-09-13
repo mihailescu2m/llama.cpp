@@ -69,6 +69,26 @@ struct llama_moe_stream_weight {
 
 struct llama_moe_stream_layer;
 
+// Userdata for the remap op when one-layer-ahead prefetch is on. The op keeps its normal job for
+// THIS layer and additionally predicts the NEXT layer's routing from this layer's router input,
+// issuing those loads a layer early.
+//
+// The prediction is deliberately the cheap one: topk(W_next . x_L). It skips the attention and FFN
+// terms between the two layers, so it is a lower bound - measured 72.1% top-6 overlap, and 46.3% of
+// the experts that actually STALL at K=6, for 0.35 wasted reads per layer-token. The exact version
+// would need layer L+1's attention output, i.e. running attention twice per layer (5 GB/token), so
+// it is not worth having.
+struct llama_moe_stream_lookahead {
+    llama_moe_stream_layer * sl      = nullptr; // this layer, remapped as usual
+    llama_moe_stream_layer * sl_next = nullptr; // layer to prefetch into, null = plain remap
+    uint32_t                 top_k   = 0;       // how many predicted experts to fetch
+    ggml_tensor *            bias_src = nullptr;// next layer's exp_probs_b, may be null
+    bool                     bias_read = false;
+    std::vector<float>       bias;              // host copy of bias_src, filled on first use
+    std::vector<float>       score;             // scratch [n_expert]
+    std::vector<int32_t>     selected;          // bounded, unique prefetch candidates
+};
+
 // userdata of one wave's custom ops (multi-pass prefill): identifies which pass this is
 struct llama_moe_stream_wave {
     llama_moe_stream_layer * sl   = nullptr;
@@ -91,6 +111,8 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t>                 slot_pending;  // [n_slots] slabs still in flight for this slot
     std::vector<uint64_t>                slot_gen;      // [n_slots] reservation generation
     std::vector<int64_t>                 slot_last_use; // [n_slots] LRU stamps
+    std::vector<uint8_t>                 slot_spec;     // [n_slots] filled by the lookahead prefetch,
+                                                        //           not yet claimed by a demand hit
     std::unordered_map<int32_t, int32_t> expert_slot;   // RESIDENT and LOADING entries
 
     std::vector<uint32_t> route_hotness; // [n_expert] decayed selection counts, for eviction
@@ -138,6 +160,11 @@ struct llama_moe_stream_layer {
     // (e.g. grovemoe evaluates a second, unstreamed expert group on the same layer index)
     bool matches(const ggml_tensor * gate, const ggml_tensor * up,
                  const ggml_tensor * down, const ggml_tensor * gate_up) const;
+
+    // one-layer-ahead prefetch (LLAMA_MOE_STREAM_LOOKAHEAD=K). Set by the model at load time so
+    // build_moe_ffn can reach the NEXT layer's router without a signature change.
+    ggml_tensor * la_gate_inp = nullptr;   // next layer's ffn_gate_inp
+    std::unique_ptr<llama_moe_stream_lookahead> la;
 };
 
 // one queued expert load
@@ -296,6 +323,10 @@ struct llama_moe_stream {
     size_t demand_inflight = 0;
     std::vector<llama_moe_stream_work> reads_inflight; // one entry per worker, guarded by mtx
 
+    // cap the speculative backlog: a prefetch that is still queued when its layer arrives has done
+    // nothing but reserve a slot and burn bandwidth
+    size_t q_spec_max = 0;
+
     std::vector<std::thread> workers;
     bool workers_started = false;
     bool shutting_down   = false;
@@ -401,6 +432,11 @@ struct llama_moe_stream {
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+// remap for THIS layer (src a, as above) plus a lookahead prefetch for the next layer driven by
+// this layer's router input (src b, f32 [n_embd] already multiplied by the next layer's gate_inp,
+// i.e. b holds the next layer's predicted logits). userdata is a llama_moe_stream_lookahead.
+void llama_moe_stream_remap_la(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids
