@@ -344,11 +344,17 @@ struct ggml_metal_fusion_info * ggml_metal_device_get_fusion_info(ggml_metal_dev
 typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
+// as ggml_metal_buffer_init, with n_split page-aligned ranges allocated as separate memory objects (shared only)
+ggml_metal_buffer_t ggml_metal_buffer_init_split(ggml_metal_device_t dev, size_t size, bool shared,
+                                                 const size_t * split_offs, const size_t * split_sizes, int n_split);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
+
+// see ggml_backend_metal_buffer_set_views
+bool   ggml_metal_buffer_set_views(ggml_metal_buffer_t buf, const size_t * offs, const size_t * sizes, int n);
 
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);

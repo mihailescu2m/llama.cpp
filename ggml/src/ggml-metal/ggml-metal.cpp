@@ -103,6 +103,18 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
     /* .get_host_ptr  = */ ggml_backend_metal_buffer_shared_get_base,
 };
 
+bool ggml_backend_metal_buffer_set_views(ggml_backend_buffer_t buffer, const size_t * offs, const size_t * sizes, int n) {
+    if (buffer == nullptr || buffer->iface.get_base != ggml_backend_metal_buffer_shared_get_base) {
+        return false;
+    }
+    return ggml_metal_buffer_set_views((ggml_metal_buffer_t) buffer->context, offs, sizes, n);
+}
+
+bool ggml_backend_metal_buffer_has_views(ggml_backend_buffer_t buffer) {
+    return buffer != nullptr && buffer->iface.get_base == ggml_backend_metal_buffer_shared_get_base &&
+           ggml_metal_buffer_is_shared((ggml_metal_buffer_t) buffer->context);
+}
+
 // private buffer
 
 static void ggml_backend_metal_buffer_private_free_buffer(ggml_backend_buffer_t buffer) {
@@ -265,6 +277,23 @@ static const char * ggml_backend_metal_buffer_type_shared_get_name(ggml_backend_
 
 static ggml_backend_buffer_t ggml_backend_metal_buffer_type_shared_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     return ggml_backend_metal_buffer_type_alloc_buffer(buft, size, true);
+}
+
+ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_split(ggml_backend_buffer_type_t buft, size_t size,
+                                                                 const size_t * offs, const size_t * sizes, int n) {
+    if (buft == nullptr || buft->iface.alloc_buffer != ggml_backend_metal_buffer_type_shared_alloc_buffer) {
+        return nullptr;
+    }
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
+    ggml_metal_buffer_t res = ggml_metal_buffer_init_split(ctx_dev, size, true, offs, sizes, n);
+    if (res == NULL) {
+        return nullptr;
+    }
+    if (!ggml_metal_buffer_is_shared(res)) {
+        ggml_metal_buffer_free(res);
+        return nullptr;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_metal_buffer_shared_i, res, size);
 }
 
 static size_t ggml_backend_metal_buffer_type_shared_get_alignment(ggml_backend_buffer_type_t buft) {

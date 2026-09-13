@@ -54,6 +54,25 @@ GGML_BACKEND_API bool ggml_backend_metal_supports_family(ggml_backend_t backend,
 // capture all command buffers committed the next time `ggml_backend_graph_compute` is called
 GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t backend);
 
+// Replace the GPU views of a shared (host-memory) buffer by n page-aligned [offs[i], offs[i] + sizes[i])
+// ranges, ascending, non-overlapping and inside the buffer. Tensors must lie entirely within one view.
+// The new views are registered for residency before the old ones are dropped, so memory both cover
+// stays wired throughout and only what the new views leave out loses its wiring - which the driver
+// does asynchronously. A caller returning that memory to the system must wait for it: a page released
+// while still wired stays with the allocation, unmapped and unreachable, until the system swaps it.
+// Returns false and leaves the buffer unchanged if it is not a Metal shared buffer or a view cannot
+// be created. The device must be idle.
+GGML_BACKEND_API bool ggml_backend_metal_buffer_set_views(ggml_backend_buffer_t buffer, const size_t * offs, const size_t * sizes, int n);
+
+// Allocate a buffer of the Metal shared buffer type whose n page-aligned [offs[i], offs[i] + sizes[i])
+// ranges are separate memory objects, so each can later be returned to the system whole: the kernel does
+// not free part of an object while the rest stays mapped. Returns NULL if buft is not that buffer type.
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_split(ggml_backend_buffer_type_t buft, size_t size,
+                                                                                 const size_t * offs, const size_t * sizes, int n);
+
+// whether ggml_backend_metal_buffer_set_views applies to this buffer
+GGML_BACKEND_API bool ggml_backend_metal_buffer_has_views(ggml_backend_buffer_t buffer);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 #ifdef __cplusplus

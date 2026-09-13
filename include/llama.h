@@ -341,6 +341,13 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // SSD streaming of MoE routed expert weights (experts are paged from the GGUF on demand
+        // into a per-layer cache of moe_stream_slots experts; requires moe_stream = true)
+        uint32_t moe_stream_slots;      // expert cache slots per streamed layer (0 = auto)
+        uint64_t moe_stream_budget;     // total cache byte budget, used when slots == 0 (0 = auto heuristic)
+        int32_t  moe_stream_io_threads; // expert load I/O threads (<= 0 = default)
+        bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -348,6 +355,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool moe_stream;      // stream MoE routed expert weights from disk on demand
     };
 
     struct llama_sampler_seq_config {
@@ -1605,6 +1613,54 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
+
+    // print MoE expert streaming statistics (no-op when streaming is not enabled)
+    LLAMA_API void llama_moe_stream_print_stats(const struct llama_model * model);
+
+    // MoE expert streaming counters since load, for monitoring
+    struct llama_moe_stream_counters {
+        int64_t n_hit;            // touched experts already resident or loading
+        int64_t n_miss;           // demand loads issued
+        int64_t n_miss_cold;      // first-ever touch of an expert
+        int64_t n_hit_loading;    // decode hits on a slot still loading (prefetch late)
+        int64_t n_hit_ready;      // decode hits on a resident slot
+        int64_t n_preload_issued; // next-wave loads started during a wave (prefill)
+        int64_t n_preload_ready;  // wave experts already resident from the previous preload
+        int64_t n_warm_issued;    // experts queued by the decode warm-up
+        int64_t t_stall_us;       // waiting for demand loads, decode path
+        int64_t t_stall_wave_us;  // waiting for demand loads, prefill waves
+        int64_t t_io_read_us;     // SSD read time, summed over I/O threads
+        int64_t n_slabs_read;
+        int64_t n_bytes_read;     // expert payload bytes read, excluding PLE rows
+    };
+
+    // copies the counters; false (and *out untouched) when streaming is not enabled
+    LLAMA_API bool llama_moe_stream_get_counters(const struct llama_model * model, struct llama_moe_stream_counters * out);
+
+    // Rebuild target and optional draft compute workspaces for a new prompt/decode phase. The
+    // logical batch limit and all persistent model state remain unchanged. If moe_stream_slots is
+    // non-zero, the target model's streamed expert cache is resized while both graphs are absent.
+    // UINT32_MAX chooses cache growth from the measured compute-buffer reduction, less a layer
+    // migration buffer and a 512 MiB margin. Zero keeps the cache fixed. Auto mode requires CPU or
+    // unified-memory Metal buffers. The caller must supply all contexts sharing this model.
+    // Experimental: intended for phase boundaries in single-conversation servers.
+    LLAMA_API bool llama_memory_phase_transition(
+            struct llama_context * ctx_tgt,
+            struct llama_context * ctx_dft,
+            uint32_t               n_ubatch_tgt,
+            uint32_t               n_ubatch_dft,
+            uint32_t               moe_stream_slots);
+
+    // Total currently allocated compute-scheduler storage across all backends.
+    LLAMA_API uint64_t llama_compute_buffer_size(const struct llama_context * ctx);
+
+    // Current streamed-expert cache allocation and capacity (zero when streaming is disabled).
+    LLAMA_API uint64_t llama_moe_stream_cache_size (const struct llama_model * model);
+    LLAMA_API uint32_t llama_moe_stream_cache_slots(const struct llama_model * model);
+    LLAMA_API uint32_t llama_moe_stream_slots_for_budget(
+            const struct llama_model * model,
+            uint64_t                   budget,
+            uint32_t                   n_slots_min);
 
     //
     // training

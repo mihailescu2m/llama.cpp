@@ -1,3 +1,4 @@
+#include <sys/mman.h>
 #import "ggml-metal-device.h"
 #import "ggml-metal-fusion.h"
 
@@ -2098,7 +2099,8 @@ static void * ggml_metal_host_malloc(size_t n) {
     return data;
 }
 
-ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
+ggml_metal_buffer_t ggml_metal_buffer_init_split(ggml_metal_device_t dev, size_t size, bool shared,
+                                                 const size_t * split_offs, const size_t * split_sizes, int n_split) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
@@ -2118,6 +2120,30 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     if (shared) {
         res->all_data = ggml_metal_host_malloc(size_aligned);
         res->is_shared = true;
+
+        // Ranges the caller will return to the system whole, each made its own memory object before
+        // anything wraps or touches the buffer: the kernel does not free part of an object while the
+        // rest stays mapped (measured: released that way, the pages stayed as anonymous memory).
+#if TARGET_OS_OSX
+        for (int i = 0; res->all_data != NULL && i < n_split; ++i) {
+            vm_address_t a = (vm_address_t) ((uint8_t *) res->all_data + split_offs[i]);
+            if (split_offs[i] % size_page != 0 || split_sizes[i] == 0 || split_sizes[i] % size_page != 0 ||
+                    split_offs[i] + split_sizes[i] > size_aligned ||
+                    vm_allocate((vm_map_t) mach_task_self(), &a, split_sizes[i], VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) {
+                GGML_LOG_ERROR("%s: error: cannot split range %d (offset %zu, size %zu)\n", __func__, i, split_offs[i], split_sizes[i]);
+                vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) res->all_data, size_aligned);
+                free(res);
+                return NULL;
+            }
+        }
+#else
+        if (n_split > 0) {
+            GGML_LOG_ERROR("%s: error: split allocations need vm_allocate\n", __func__);
+            free(res->all_data);
+            free(res);
+            return NULL;
+        }
+#endif
     } else {
         // use virtual address
         res->all_data = (void *) atomic_fetch_add_explicit(&dev->addr_virt, size_aligned, memory_order_relaxed);
@@ -2166,6 +2192,10 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     //ggml_metal_log_allocated_size(device, size_aligned);
 
     return res;
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
+    return ggml_metal_buffer_init_split(dev, size, shared, NULL, NULL, 0);
 }
 
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
@@ -2291,6 +2321,81 @@ void * ggml_metal_buffer_get_base(ggml_metal_buffer_t buf) {
 
 bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
+}
+
+bool ggml_metal_buffer_set_views(ggml_metal_buffer_t buf, const size_t * offs, const size_t * sizes, int n) {
+    if (!buf->is_shared || !buf->owned || n <= 0 || n > GGML_METAL_MAX_BUFFERS) {
+        return false;
+    }
+
+    const size_t page = sysconf(_SC_PAGESIZE);
+    size_t end = 0;
+    for (int i = 0; i < n; ++i) {
+        if (offs[i] % page != 0 || sizes[i] == 0 || sizes[i] % page != 0 || offs[i] < end ||
+                offs[i] + sizes[i] > buf->all_size) {
+            GGML_LOG_ERROR("%s: invalid view %d: offset %zu, size %zu (buffer %zu)\n", __func__, i, offs[i], sizes[i], buf->all_size);
+            return false;
+        }
+        end = offs[i] + sizes[i];
+    }
+
+    @autoreleasepool {
+        // create every new view before touching the old ones, so a failure leaves the buffer intact
+        id<MTLBuffer> views[GGML_METAL_MAX_BUFFERS];
+        for (int i = 0; i < n; ++i) {
+            views[i] = [buf->dev->mtl_device newBufferWithBytesNoCopy:(uint8_t *) buf->all_data + offs[i]
+                                                                length:sizes[i]
+                                                               options:MTLResourceStorageModeShared
+                                                           deallocator:nil];
+            if (views[i] == nil) {
+                GGML_LOG_ERROR("%s: failed to create view %d (%zu bytes)\n", __func__, i, sizes[i]);
+                for (int j = 0; j < i; ++j) {
+                    [views[j] release];
+                }
+                return false;
+            }
+        }
+
+        struct ggml_metal_buffer_wrapper old[GGML_METAL_MAX_BUFFERS];
+        const int n_old = buf->n_buffers;
+        for (int i = 0; i < n_old; ++i) {
+            old[i] = buf->buffers[i];
+        }
+        id old_rset = buf->rset;
+        buf->rset = nil;
+
+        // register the new views first: what both cover never loses its wiring
+        for (int i = 0; i < n; ++i) {
+            buf->buffers[i].data  = (uint8_t *) buf->all_data + offs[i];
+            buf->buffers[i].size  = sizes[i];
+            buf->buffers[i].metal = views[i];
+        }
+        buf->n_buffers = n;
+        if (!ggml_metal_buffer_rset_init(buf)) {
+            // the views work without a residency set, only without its residency hint
+            GGML_LOG_WARN("%s: failed to rebuild the residency set\n", __func__);
+            buf->rset = nil;
+        }
+        ggml_metal_device_rsets_add(buf->dev, buf->rset);
+
+        // then drop the old views and their set; the driver unwires what the new views leave out
+        ggml_metal_device_rsets_rm(buf->dev, old_rset);
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+        if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+            if (old_rset) {
+                [old_rset endResidency];
+                [old_rset removeAllAllocations];
+                [old_rset commit];
+                [old_rset release];
+            }
+        }
+#endif
+        for (int i = 0; i < n_old; ++i) {
+            [old[i].metal release];
+        }
+    }
+
+    return true;
 }
 
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
