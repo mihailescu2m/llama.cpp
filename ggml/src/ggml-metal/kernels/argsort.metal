@@ -323,6 +323,7 @@ kernel void kernel_top_k_f32_i32(
 
     // emit everything above the threshold, then fill the rest from ties
     const uint threshold = prefix;
+    const uint tie_count = atomic_load_explicit(&histo[threshold & 0xFFu], memory_order_relaxed);
 
     for (uint i = tid; i < ncols; i += ntg_x) {
         if (ggml_top_k_f2ui(src0_row[i]) > threshold) {
@@ -332,12 +333,47 @@ kernel void kernel_top_k_f32_i32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = tid; i < ncols; i += ntg_x) {
-        if (ggml_top_k_f2ui(src0_row[i]) == threshold) {
-            const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-            if (pos < top_k) {
-                dst_row[pos] = (int32_t) i;
+    if (tie_count <= desired) {
+        // No cutoff ambiguity: keep the existing fast unordered emission.
+        for (uint i = tid; i < ncols; i += ntg_x) {
+            if (ggml_top_k_f2ui(src0_row[i]) == threshold) {
+                const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+                if (pos < top_k) {
+                    dst_row[pos] = (int32_t) i;
+                }
             }
+        }
+    } else {
+        // Equal indexer scores can refer to different K/V values. Atomic arrival
+        // order must not choose which members of a cutoff tie survive. Compact
+        // ties in increasing input-index order, reusing the histogram as scratch.
+        // TOP_K remains unordered; only membership of the selected set is fixed.
+        const uint lane = tid % N_SIMDWIDTH;
+        const uint sg = tid / N_SIMDWIDTH;
+        const uint nsg = (ntg_x + N_SIMDWIDTH - 1)/N_SIMDWIDTH;
+        uint emitted = 0;
+        for (uint base = 0; base < ncols && emitted < desired; base += ntg_x) {
+            const uint i = base + tid;
+            const uint match = i < ncols && ggml_top_k_f2ui(src0_row[i]) == threshold ? 1u : 0u;
+            const uint local = simd_prefix_exclusive_sum(match);
+            const uint count = simd_sum(match);
+            if (lane == 0) { atomic_store_explicit(&histo[sg], count, memory_order_relaxed); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sg == 0) {
+                const uint count_sg = lane < nsg ? atomic_load_explicit(&histo[lane], memory_order_relaxed) : 0u;
+                const uint offset_sg = simd_prefix_exclusive_sum(count_sg);
+                const uint total = simd_sum(count_sg);
+                if (lane < nsg) { atomic_store_explicit(&histo[lane], offset_sg, memory_order_relaxed); }
+                if (lane == 0) { *sh_above = total; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint pos = emitted + atomic_load_explicit(&histo[sg], memory_order_relaxed) + local;
+            if (match && pos < desired) { dst_row[top_k - desired + pos] = (int32_t) i; }
+            emitted += *sh_above;
+            // All threads must consume offsets/count before the next tile overwrites them.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 }
