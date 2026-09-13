@@ -2630,6 +2630,11 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+                    res->has_moe             = llama_moe_stream_get_counters(model_tgt, &res->moe);
+                    res->has_moe_dft         = model_dft && llama_moe_stream_get_counters(model_dft, &res->moe_dft);
+                    res->moe_cache_bytes     = llama_moe_stream_cache_size(model_tgt);
+                    res->moe_cache_slots     = llama_moe_stream_cache_slots(model_tgt);
+                    res->memory_phase        = memory_phase_enabled ? (memory_phase_decode ? 1 : 0) : -1;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();

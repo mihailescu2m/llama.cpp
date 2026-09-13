@@ -1602,6 +1602,43 @@ std::string server_task_result_metrics::to_metrics() {
     add_items("counter", counters);
     add_items("gauge",   gauges);
 
+    if (has_moe) {
+        add_items("counter", {
+            { "moe_stream_hits_total",          "MoE streaming: touched experts already resident or loading", (double) moe.n_hit },
+            { "moe_stream_misses_total",        "MoE streaming: demand loads issued",                          (double) moe.n_miss },
+            { "moe_stream_misses_cold_total",   "MoE streaming: first-ever touches of an expert",              (double) moe.n_miss_cold },
+            { "moe_stream_hits_loading_total",  "MoE streaming: decode hits on a slot still loading",          (double) moe.n_hit_loading },
+            { "moe_stream_hits_ready_total",    "MoE streaming: decode hits on a resident slot",               (double) moe.n_hit_ready },
+            { "moe_stream_preloads_issued_total", "MoE streaming: next-wave loads started during a wave",      (double) moe.n_preload_issued },
+            { "moe_stream_preloads_ready_total",  "MoE streaming: preloads resident before their demand (waves and lookahead)", (double) moe.n_preload_ready },
+            { "moe_stream_warm_issued_total",   "MoE streaming: experts queued by the decode warm-up",         (double) moe.n_warm_issued },
+            { "moe_stream_stall_seconds_total", "MoE streaming: time waiting for demand loads (decode)",       moe.t_stall_us / 1.e6 },
+            { "moe_stream_victim_wait_seconds_total", "MoE streaming: reusable-slot wait (part of stall)",    moe.t_victim_wait_us / 1.e6 },
+            { "moe_stream_remap_lock_seconds_total", "MoE streaming: manager-lock acquisition",             moe.t_remap_lock_us / 1.e6 },
+            { "moe_stream_wave_stall_seconds_total", "MoE streaming: time waiting for demand loads (prefill waves)", moe.t_stall_wave_us / 1.e6 },
+            { "moe_stream_read_seconds_total",  "MoE streaming: SSD read time summed over I/O threads",        moe.t_io_read_us / 1.e6 },
+            { "moe_stream_read_slabs_total",    "MoE streaming: slabs read",                                   (double) moe.n_slabs_read },
+            { "moe_stream_read_bytes_total",    "MoE streaming: expert bytes read, excluding PLE",             (double) moe.n_bytes_read },
+        });
+        add_items("gauge", {
+            { "moe_stream_cache_bytes", "MoE streaming: expert cache allocation", (double) moe_cache_bytes },
+            { "moe_stream_cache_slots", "MoE streaming: expert cache slots",      (double) moe_cache_slots },
+        });
+    }
+    if (has_moe_dft) {
+        add_items("counter", {
+            { "moe_stream_draft_hits_total",          "MoE streaming, draft model: hits",   (double) moe_dft.n_hit },
+            { "moe_stream_draft_misses_total",        "MoE streaming, draft model: misses", (double) moe_dft.n_miss },
+            { "moe_stream_draft_stall_seconds_total", "MoE streaming, draft model: stall",  (moe_dft.t_stall_us + moe_dft.t_stall_wave_us) / 1.e6 },
+            { "moe_stream_draft_read_bytes_total",    "MoE streaming, draft model: bytes read", (double) moe_dft.n_bytes_read },
+        });
+    }
+    if (memory_phase >= 0) {
+        add_items("gauge", {
+            { "memory_phase", "Memory phase: 0 prefill, 1 decode", (double) memory_phase },
+        });
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"

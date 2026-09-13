@@ -497,6 +497,15 @@ struct server_task_result_metrics : server_task_result {
 
     server_metrics metrics;
 
+    // MoE expert streaming (target and draft), cache size and memory phase
+    bool     has_moe         = false;
+    bool     has_moe_dft     = false;
+    llama_moe_stream_counters moe     = {};
+    llama_moe_stream_counters moe_dft = {};
+    uint64_t moe_cache_bytes = 0;
+    uint32_t moe_cache_slots = 0;
+    int32_t  memory_phase    = -1; // -1 off, 0 prefill, 1 decode
+
     virtual json to_json() override;
 
     struct metric_item {

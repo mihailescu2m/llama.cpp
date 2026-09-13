@@ -2444,6 +2444,8 @@ bool llama_moe_stream_get_counters(const llama_model * model, llama_moe_stream_c
     out->t_io_read_us     = st.t_io_read_us;
     out->n_slabs_read     = st.n_slabs_read;
     out->n_bytes_read     = st.n_bytes_read;
+    out->t_victim_wait_us = st.t_victim_wait_us;
+    out->t_remap_lock_us  = st.t_remap_lock_us;
 
     return true;
 }

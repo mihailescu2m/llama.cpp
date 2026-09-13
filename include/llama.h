@@ -1632,6 +1632,8 @@ extern "C" {
         int64_t t_io_read_us;     // SSD read time, summed over I/O threads
         int64_t n_slabs_read;
         int64_t n_bytes_read;     // expert payload bytes read, excluding PLE rows
+        int64_t t_victim_wait_us; // subset of t_stall_us: waiting for a reusable slot
+        int64_t t_remap_lock_us;  // manager lock acquisition; not included in IO stall
     };
 
     // copies the counters; false (and *out untouched) when streaming is not enabled
