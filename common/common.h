@@ -377,6 +377,11 @@ struct common_params_speculative {
     // Model-backed draft prefill can cost more than it saves for short answers at long context.
     int32_t n_prompt_max = 0;
 
+    // Optional deterministic n-gram suffix after a complete MTP draft (server only).
+    // This extends verification, NOT the model drafter or need_n_rs_seq().
+    // Uses ngram_mod.n_match for lookup; its n_min/n_max do not apply to the suffix.
+    int32_t mtp_ngram_n_max = 0;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 

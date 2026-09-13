@@ -99,6 +99,13 @@ json server_slot_stats::to_json() const {
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+        base["draft_verification_steps"] = n_draft_verif_steps;
+        base["draft_mtp_n"] = n_draft_mtp_tokens;
+        base["draft_mtp_n_accepted"] = n_draft_mtp_accepted;
+        base["draft_ngram_n"] = n_draft_ngram_tokens;
+        base["draft_ngram_n_accepted"] = n_draft_ngram_accepted;
+        base["draft_replays"] = n_draft_replays;
+        base["draft_checkpoint_bytes"] = n_draft_checkpoint_bytes;
     }
 
     return base;

@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-ngram.h"
 #include "speculative-state.h"
 
 #include "common.h"
@@ -1464,6 +1465,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool rejection = false; // propose from a distribution, verify by min(1, p_tgt/q)
 
+    int32_t n_ngram_max = 0;
+    std::vector<std::unique_ptr<common_speculative_ngram>> ngram_suffix;
+
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
@@ -1524,6 +1528,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+        , n_ngram_max(params.mtp_ngram_n_max)
         , params(params.draft)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -1596,6 +1601,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 c.reserve((size_t) (this->params.n_max + 1) * n_embd);
             }
         }
+        this->n_max = this->params.n_max + n_ngram_max;
+
+        if (n_ngram_max > 0) {
+            ngram_suffix.reserve(n_seq);
+            for (uint32_t i = 0; i < n_seq; ++i) {
+                ngram_suffix.emplace_back(new common_speculative_ngram(params.ngram_mod.n_match));
+            }
+            SPC_INF("MTP + n-gram: model depth = %d, suffix <= %d, match = %d, lookup = %.2f MiB/seq; recurrent depth unchanged\n",
+                    this->params.n_max, n_ngram_max, params.ngram_mod.n_match,
+                    ngram_suffix.front()->size_bytes() / (1024.0*1024.0));
+        }
+
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
@@ -1629,6 +1646,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (!ngram_suffix.empty()) {
+            ngram_suffix[seq_id]->reset();
+        }
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1717,6 +1737,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        if (!ngram_suffix.empty()) {
+            ngram_suffix[seq_id]->reset();
+        }
         std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
         pending_pos[seq_id] = -1;
         verify_pos[seq_id].clear();
@@ -2045,6 +2068,41 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_dist->clear();
                 }
             }
+
+            dp.n_mtp = (int32_t) dp.result->size();
+            dp.n_ngram = 0;
+
+            // Only extend a full model prefix. In particular, a confidence cutoff or context/
+            // output limit must not turn "MTP 3 + lookup" into a lookup at an earlier depth.
+            if (ngram_suffix.empty() || dp.n_mtp != params.n_max || dp.n_mtp == 0) {
+                continue;
+            }
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(params.ctx_tgt));
+            if (std::any_of(dp.result->begin(), dp.result->end(),
+                    [&](llama_token t) { return llama_vocab_is_eog(vocab, t); })) {
+                continue;
+            }
+            const int32_t n_tail = dp.n_max > 0 ? std::min(n_ngram_max, dp.n_max - dp.n_mtp) : n_ngram_max;
+            if (n_tail <= 0) {
+                continue;
+            }
+            const auto suffix = ngram_suffix[seq_id]->draft(*dp.prompt, dp.id_last, *dp.result, n_tail);
+            const bool record_q = rejection && dp.propose_sampled && dp.result_dist &&
+                                  dp.result_dist->size() == dp.result->size();
+            for (const llama_token token : suffix) {
+                dp.result->push_back(token);
+                ++dp.n_ngram;
+                if (record_q) {
+                    // The lookup deterministically chooses this token conditional on the
+                    // MTP prefix. Its proposal distribution is delta(token), not the MTP q.
+                    dp.result_dist->push_back({{token, 0.0f, 1.0f}});
+                }
+                if (llama_vocab_is_eog(vocab, token)) {
+                    break;
+                }
+            }
+            SPC_DBG("MTP + n-gram seq=%d: prefix=%d suffix=%d total=%zu\n",
+                    seq_id, dp.n_mtp, dp.n_ngram, dp.result->size());
         }
     }
 
@@ -2652,14 +2710,29 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
 int32_t common_speculative_n_max(const common_params_speculative * spec) {
     int32_t n_max = 0;
 
+    if (spec->mtp_ngram_n_max < 0 || spec->mtp_ngram_n_max > 64) {
+        throw std::invalid_argument("MTP n-gram suffix length must be in [0, 64]");
+    }
+    if (spec->mtp_ngram_n_max > 0) {
+        if (std::find(spec->types.begin(), spec->types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == spec->types.end() ||
+            spec->draft.n_max <= 0 || spec->draft.n_max > INT32_MAX - spec->mtp_ngram_n_max) {
+            throw std::invalid_argument("MTP n-gram suffix requires draft-mtp with a positive, bounded model draft depth");
+        }
+        if (spec->ngram_mod.n_match <= 0 || spec->ngram_mod.n_match > UINT16_MAX) {
+            throw std::invalid_argument("MTP n-gram match length must be in [1, 65535]");
+        }
+    }
+
     for (const auto type : spec->types) {
         switch (type) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
-            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max) + spec->mtp_ngram_n_max);
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
@@ -2980,6 +3053,11 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+    // Validate before constructing a drafter or allocating its lookup index.
+    common_speculative_n_max(&params);
+    if (params.mtp_ngram_n_max > 0 && params.draft.ctx_dft == nullptr) {
+        throw std::invalid_argument("MTP + n-gram requires an initialized MTP drafter");
+    }
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
@@ -3306,6 +3384,8 @@ void common_speculative_draft(common_speculative * spec) {
                             }
                         }
                         result.resize(dp.n_max);
+                        dp.n_mtp = std::min(dp.n_mtp, dp.n_max);
+                        dp.n_ngram = std::min(dp.n_ngram, dp.n_max - dp.n_mtp);
                     }
                 }
 
@@ -3342,7 +3422,8 @@ void common_speculative_draft(common_speculative * spec) {
     }
 }
 
-void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted,
+                               int32_t n_accepted_stats) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3353,17 +3434,20 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
 
-        if (impl->n_acc_tokens_per_pos.size() < n_accepted) {
-            impl->n_acc_tokens_per_pos.resize(n_accepted, 0);
+        const size_t n_credit = n_accepted_stats >= 0 ? (size_t) n_accepted_stats : n_accepted;
+        GGML_ASSERT(n_credit <= n_accepted);
+
+        if (impl->n_acc_tokens_per_pos.size() < n_credit) {
+            impl->n_acc_tokens_per_pos.resize(n_credit, 0);
         }
 
-        for (size_t i = 0; i < n_accepted; ++i) {
+        for (size_t i = 0; i < n_credit; ++i) {
             impl->n_acc_tokens_per_pos[i]++;
         }
 
-        if (n_accepted > 0) {
+        if (n_credit > 0) {
             impl->n_acc_drafts++;
-            impl->n_acc_tokens += n_accepted;
+            impl->n_acc_tokens += n_credit;
         }
 
         impl->accept(seq_id, n_accepted, false);

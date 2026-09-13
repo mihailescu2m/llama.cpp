@@ -75,6 +75,10 @@ struct common_speculative_draft_params {
     // for exact-match verification, in which case nothing is recorded.
     std::vector<std::vector<llama_token_data>> * result_dist = nullptr;
 
+    // Composition provenance, filled by MTP. Other implementations leave these at zero.
+    int32_t n_mtp = 0;
+    int32_t n_ngram = 0;
+
     // Whether this sequence's drafts will be verified by rejection sampling. When the verifier
     // falls back to exact match (greedy, grammar, stateful samplers), a drafter configured for
     // rejection proposes the mode instead of a random draw, which exact match would mostly reject.
@@ -117,7 +121,10 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+// n_accepted advances the drafter's boundary. A decision-preserving checkpoint replay may also
+// evaluate a target replacement token: n_accepted_stats excludes it from proposal acceptance.
+void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted,
+                               int32_t n_accepted_stats = -1);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

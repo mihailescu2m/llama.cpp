@@ -82,18 +82,18 @@ static bool rejection_verifier_supported(const common_params_sampling & sp) {
         && sp.adaptive_target < 0.0f;
 }
 
-// Sixth condition, and the only one that depends on the context rather than the sampler.
-// A checkpoint replay clears the recorded proposal distributions, restores the target sampler and
-// re-verifies by exact match, which changes decisions rejection sampling has already made. So the
-// context must be able to roll the draft back without one. Worst case is the whole draft:
-// n_rollback = draft.size() + 1 - accepted.size() and accepted.size() >= 1. Decided here, before
-// sampling, because accepted.size() does not exist yet.
-static bool rejection_rollback_safe(common_context_seq_rm_type type, llama_context * ctx, size_t n_draft) {
+// Legacy checkpoint replay restores the pre-verification sampler and re-verifies by exact match,
+// so it cannot preserve rejection-sampling decisions. The opt-in MTP/ngram path instead preserves
+// those decisions and the post-verification sampler. It can verify beyond n_rs_seq when a current
+// checkpoint is available; at least one rollback slot also handles replay ending at EOG.
+static bool rejection_rollback_safe(common_context_seq_rm_type type, llama_context * ctx, size_t n_draft,
+                                    bool decision_replay_ready) {
     if (type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
         return true;
     }
     if (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
-        return (size_t) llama_n_rs_seq(ctx) >= n_draft;
+        return (size_t) llama_n_rs_seq(ctx) >= n_draft ||
+               (llama_n_rs_seq(ctx) > 0 && decision_replay_ready);
     }
     return false;   // NO and FULL both reach the draft only through a checkpoint
 }
@@ -325,6 +325,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    server_speculative_replay spec_replay_decided;
+    int32_t spec_n_mtp = 0;
+    int32_t spec_n_ngram = 0;
     std::mt19937 spec_synth_rng;
     std::mt19937 spec_rej_rng;
 
@@ -472,6 +475,9 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_replay_decided.clear();
+        spec_n_mtp = 0;
+        spec_n_ngram = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -603,6 +609,12 @@ struct server_slot {
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
+
+        // Cap the COMBINED draft (including any n-gram suffix) before asking the drafter.
+        // Budget for all slots, not only today's active ones, so a later checkpoint replay
+        // keeps its entire decided prefix even if more slots become active in the meantime.
+        n_draft_max = server_speculative_draft_limit(
+                n_draft_max, llama_n_batch(ctx_tgt), llama_n_seq_max(ctx_tgt));
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
@@ -784,6 +796,16 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            // The suffix's proposals are counted in the ratio above, so a rejected suffix lowers it
+            // even on steps where more tokens landed. Report its own share so the two can be told apart.
+            if (stats.n_draft_ngram_tokens > 0) {
+                SLT_INF(*this,
+                        "  n-gram suffix = %0.5f (%5d accepted / %5d proposed), MTP = %5d accepted / %5d proposed\n",
+                        (double) stats.n_draft_ngram_accepted / stats.n_draft_ngram_tokens,
+                        (int) stats.n_draft_ngram_accepted, (int) stats.n_draft_ngram_tokens,
+                        n_draft_accepted - (int) stats.n_draft_ngram_accepted,
+                        n_draft_total - (int) stats.n_draft_ngram_tokens);
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
@@ -1393,6 +1415,12 @@ private:
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        if (params_base.speculative.mtp_ngram_n_max > 0 &&
+            ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+            !(ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx_tgt) > 0)) {
+            SRV_ERR("%s", "MTP + n-gram requires partial target rollback or at least one recurrent rollback slot\n");
+            return false;
+        }
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -1416,7 +1444,7 @@ private:
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
-                if (params_base.speculative.has_synth()) {
+                if (params_base.speculative.has_synth() || params_base.speculative.mtp_ngram_n_max > 0) {
                     return false;
                 }
             }
@@ -2020,6 +2048,13 @@ private:
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
+
+            // Hybrid replay keeps the CPU sampler post-decision and must not let a replay graph
+            // draw again at already-decided positions. Draft-side backend top-k is unaffected.
+            if (params_base.speculative.mtp_ngram_n_max > 0 && use_backend_sampling) {
+                SLT_WRN(slot, "%s", "MTP + n-gram uses CPU target sampling to preserve replay decisions\n");
+                use_backend_sampling = false;
+            }
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
@@ -3306,6 +3341,11 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            const auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+            slot.spec_n_mtp = dp.n_mtp;
+            slot.spec_n_ngram = dp.n_ngram;
+            slot.stats.n_draft_mtp_tokens += dp.n_mtp;
+            slot.stats.n_draft_ngram_tokens += dp.n_ngram;
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3336,6 +3376,8 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    slot.stats.n_draft_checkpoint_bytes = std::max<uint64_t>(
+                            slot.stats.n_draft_checkpoint_bytes, ckpt.size());
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -4265,14 +4307,27 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
 
+                // A checkpoint belongs to this exact anchor, not merely to an earlier draft in
+                // the slot. Missing/stale checkpoints must not relax rejection's rollback guard.
+                const bool decision_replay_ready = params_base.speculative.mtp_ngram_n_max > 0 &&
+                        !slot.spec_ckpt.empty() &&
+                        slot.spec_ckpt.n_tokens + (int64_t) n_draft + 1 == slot.prompt.n_tokens();
+
                 std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
+                if (slot.spec_replay_decided.active) {
+                    const auto * vocab = llama_model_get_vocab(llama_get_model(slot.ctx_tgt));
+                    accepted = slot.spec_replay_decided.finish(slot.spec_draft,
+                            [&]() { return common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch.back()); },
+                            [&](llama_token token) { common_sampler_accept(slot.smpl.get(), token, true); },
+                            [&](llama_token token) { return llama_vocab_is_eog(vocab, token); });
+                } else if (!synth_probs.empty()) {
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_draft_dist.size() == slot.spec_draft.size() &&
                            slot.task && rejection_verifier_supported(slot.task->params.sampling) &&
-                           rejection_rollback_safe(ctx_tgt_seq_rm_type, slot.ctx_tgt, slot.spec_draft.size())) {
+                           rejection_rollback_safe(ctx_tgt_seq_rm_type, slot.ctx_tgt, slot.spec_draft.size(),
+                                                   decision_replay_ready)) {
                     // the drafter recorded what each token was proposed from, so the draft can be
                     // verified by min(1, p_tgt/q) instead of by equality with the target's draw.
                     // A greedy target is a point mass: nothing a sampled proposal can be credited
@@ -4301,7 +4356,16 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        slot.spec_is_replay = true;
+                        // Preserve the verifier's decision in hybrid mode. Replaying these tokens
+                        // rebuilds model state only: the sampler and rejection RNG remain advanced.
+                        // The legacy path is retained unchanged for other speculative modes.
+                        GGML_ASSERT(!slot.spec_replay_decided.active);
+                        if (decision_replay_ready) {
+                            slot.spec_replay_decided.start(accepted);
+                        } else {
+                            slot.spec_is_replay = true;
+                        }
+                        slot.stats.n_draft_replays++;
                         slot.spec_draft = std::move(accepted);
                         slot.spec_draft_dist.clear();
 
@@ -4321,7 +4385,9 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        if (!slot.spec_replay_decided.active) {
+                            common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        }
 
                         return;
                     }
@@ -4331,7 +4397,8 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1,
+                        slot.spec_replay_decided.active ? (int32_t) slot.spec_replay_decided.n_accepted : -1);
 
                 slot.spec_draft = std::move(accepted);
                 slot.spec_draft_dist.clear();
@@ -4339,17 +4406,22 @@ private:
 
             const auto ids = std::move(slot.spec_draft);
 
-            size_t n_accepted = ids.size() - 1;
+            size_t n_accepted = slot.spec_replay_decided.active ?
+                    slot.spec_replay_decided.n_accepted : ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+            slot.spec_replay_decided.clear();
 
             slot.stats.update_gen_last();
 
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            slot.stats.n_draft_mtp_accepted += std::min<size_t>(n_accepted, slot.spec_n_mtp);
+            slot.stats.n_draft_ngram_accepted += n_accepted > (size_t) slot.spec_n_mtp ?
+                    std::min<size_t>(n_accepted - slot.spec_n_mtp, slot.spec_n_ngram) : 0;
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
