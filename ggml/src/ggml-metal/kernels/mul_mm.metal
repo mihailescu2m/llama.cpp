@@ -7,7 +7,8 @@ constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
 constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
-constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
+constant bool FC_mul_mm_id_amax    [[function_constant(FC_MUL_MM + 6)]];
+constant bool FC_mul_mm_id_compact [[function_constant(FC_MUL_MM + 7)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -367,6 +368,7 @@ kernel void kernel_mul_mm_id_map0(
         device  const char * src2,
         device        char * htpe,
         device        char * hids,
+        device        char * htiles,
         threadgroup   char * shmem [[threadgroup(0)]],
         ushort tpitg[[thread_position_in_threadgroup]],
         ushort   ntg[[threads_per_threadgroup]]) {
@@ -413,6 +415,33 @@ kernel void kernel_mul_mm_id_map0(
 
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
     tpe_u32[ide] = n_all;
+
+    // the GEMM's work list: [0] = count, then (expert << 16 | tile) for every 32-token tile an expert
+    // fills, experts in order. shmem is free again: the loop above ends on a barrier.
+    threadgroup uint32_t * soff = (threadgroup uint32_t *) shmem;
+
+    const uint32_t n_tiles = (n_all + 31)/32;
+
+    soff[ide] = n_tiles;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (ide == 0) {
+        uint32_t sum = 0;
+        for (ushort i = 0; i < ntg; i++) {
+            const uint32_t n = soff[i];
+            soff[i] = sum;
+            sum += n;
+        }
+        ((device uint32_t *) htiles)[0] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device uint32_t * tiles = (device uint32_t *) htiles + 1 + soff[ide];
+    for (uint32_t k = 0; k < n_tiles; k++) {
+        tiles[k] = ((uint32_t) ide << 16) | k;
+    }
 }
 
 kernel void kernel_mul_mm_id_amax_part_f32(
@@ -515,6 +544,7 @@ kernel void kernel_mul_mm_id(
         device const char * hids,
         device       char * dst,
         device const char * amax,
+        device const char * htiles,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -534,9 +564,25 @@ kernel void kernel_mul_mm_id(
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
+    int im; // expert
+    int r0;
+    int r1;
+    if (FC_mul_mm_id_compact) {
+        // grid (row blocks, entries of map0's list of used (expert, token tile) pairs): a tile's row
+        // blocks run back to back, so its token rows stay in cache as in the full grid
+        device const uint32_t * tiles = (device const uint32_t *) htiles;
+        if (tgpig.y >= tiles[0]) {
+            return;
+        }
+        const uint32_t t = tiles[1 + tgpig.y];
+        im = t >> 16;
+        r0 = tgpig.x*NR0;
+        r1 = (t & 0xFFFF)*NR1;
+    } else {
+        im = tgpig.z;
+        r0 = tgpig.y*NR0;
+        r1 = tgpig.x*NR1;
+    }
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
