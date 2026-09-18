@@ -1751,22 +1751,31 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    ggml_get_op_params_i32(op, 0) > 0 && ggml_get_op_params_i32(op, 0) <= (1 << 24) &&
                    ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 1) <= 8;
         case GGML_OP_FLASH_ATTN_EXT:
-            // for new head sizes, add checks here
-            if (op->src[0]->ne[0] != 32 &&
-                op->src[0]->ne[0] != 40 &&
-                op->src[0]->ne[0] != 48 &&
-                op->src[0]->ne[0] != 64 &&
-                op->src[0]->ne[0] != 72 &&
-                op->src[0]->ne[0] != 80 &&
-                op->src[0]->ne[0] != 96 &&
-                op->src[0]->ne[0] != 112 &&
-                op->src[0]->ne[0] != 128 &&
-                op->src[0]->ne[0] != 192 &&
-                op->src[0]->ne[0] != 256 &&
-                op->src[0]->ne[0] != 320 &&
-                op->src[0]->ne[0] != 512 &&
-                op->src[0]->ne[0] != 576) {
-                return false;
+            {
+                // (DK, DV) pairs that have a compiled kernel; keep in sync with fa.metal.
+                // DK alone is not enough: an accepted DK with an uninstantiated DV resolves
+                // to a missing pipeline and aborts instead of falling back to another backend.
+                static const int dkdv[][2] = {
+                    {  32,  32 }, {  40,  40 }, {  48,  48 }, {  64,  64 },
+                    {  72,  72 }, {  80,  80 }, {  96,  64 }, {  96,  96 },
+                    { 112, 112 }, { 128, 128 }, { 192, 128 }, { 192, 192 },
+                    { 256, 256 }, { 320, 256 }, { 512, 512 }, { 576, 512 },
+                };
+
+                const int64_t dk = op->src[1]->ne[0];
+                const int64_t dv = op->src[2]->ne[0];
+
+                bool found = false;
+                for (size_t i = 0; i < sizeof(dkdv)/sizeof(dkdv[0]); ++i) {
+                    if (dk == dkdv[i][0] && dv == dkdv[i][1]) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found || op->src[0]->ne[0] != dk) {
+                    return false;
+                }
             }
             if (op->src[1]->ne[0] == 72 && op->src[1]->ne[0] != op->src[2]->ne[0]) {
                 return false;
