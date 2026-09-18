@@ -562,8 +562,18 @@ void dequantize_iq2_xs(device const block_iq2_xs * xb, short il, thread type4x4 
     }
 }
 
-template <typename type4x4>
-void dequantize_iq3_xxs(device const block_iq3_xxs * xb, short il, thread type4x4 & reg) {
+// the four grid values of entry i as floats: packed bytes, or halfs pre-expanded in threadgroup memory
+template <typename grid_t>
+static inline float4 iq_grid4(grid_t grid, int i) {
+    return float4(as_type<uchar4>(grid[i]));
+}
+
+static inline float4 iq_grid4(threadgroup const half4 * grid, int i) {
+    return float4(grid[i]);
+}
+
+template <typename type4x4, typename grid_t>
+void dequantize_iq3_xxs_g(device const block_iq3_xxs * xb, short il, thread type4x4 & reg, grid_t grid) {
     // il is 0...15 for QK_K = 256 => index of block of 32 is il/2
     const float d = xb->d;
     const int ib32 = il/2;
@@ -573,24 +583,35 @@ void dequantize_iq3_xxs(device const block_iq3_xxs * xb, short il, thread type4x
     device const uint16_t * gas = (device const uint16_t *)(xb->qs + QK_K/4) + 2*ib32;
     const uint32_t aux32 = gas[0] | (gas[1] << 16);
     const float dl = d * (0.5f + (aux32 >> 28)) * 0.5f;
-    uint32_t g1 = iq3xxs_grid[q3[4*il+0]];
-    uint32_t g2 = iq3xxs_grid[q3[4*il+1]];
-    uint32_t signs = iq_ksigns(aux32 >> 14*il);
+    const uint32_t aux_s = il ? aux32 >> 14 : aux32;
+    uint32_t signs = iq_ksigns(aux_s);
+    // sign by negation rather than a +-1 multiply: same values
+    float4 v1 = dl * iq_grid4(grid, q3[4*il+0]);
+    float4 v2 = dl * iq_grid4(grid, q3[4*il+1]);
+    v1 = select(v1, -v1, (uint4(signs) & uint4(0x01, 0x02, 0x04, 0x08)) != 0);
+    v2 = select(v2, -v2, (uint4(signs) & uint4(0x10, 0x20, 0x40, 0x80)) != 0);
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        reg[0][i] = dl * ((g1 >> 8*i) & 0xFF) * (signs & (1u << (i+0)) ? -1.f : 1.f);
-        reg[1][i] = dl * ((g2 >> 8*i) & 0xFF) * (signs & (1u << (i+4)) ? -1.f : 1.f);
+        reg[0][i] = v1[i];
+        reg[1][i] = v2[i];
     }
-    g1 = iq3xxs_grid[q3[4*il+2]];
-    g2 = iq3xxs_grid[q3[4*il+3]];
-    signs = iq_ksigns(aux32 >> (14*il+7));
+    signs = iq_ksigns(aux_s >> 7);
+    v1 = dl * iq_grid4(grid, q3[4*il+2]);
+    v2 = dl * iq_grid4(grid, q3[4*il+3]);
+    v1 = select(v1, -v1, (uint4(signs) & uint4(0x01, 0x02, 0x04, 0x08)) != 0);
+    v2 = select(v2, -v2, (uint4(signs) & uint4(0x10, 0x20, 0x40, 0x80)) != 0);
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        reg[2][i] = dl * ((g1 >> 8*i) & 0xFF) * (signs & (1u << (i+0)) ? -1.f : 1.f);
-        reg[3][i] = dl * ((g2 >> 8*i) & 0xFF) * (signs & (1u << (i+4)) ? -1.f : 1.f);
+        reg[2][i] = v1[i];
+        reg[3][i] = v2[i];
     }
 }
 
 template <typename type4x4>
-void dequantize_iq3_s(device const block_iq3_s * xb, short il, thread type4x4 & reg) {
+void dequantize_iq3_xxs(device const block_iq3_xxs * xb, short il, thread type4x4 & reg) {
+    dequantize_iq3_xxs_g(xb, il, reg, iq3xxs_grid);
+}
+
+template <typename type4x4, typename grid_t>
+void dequantize_iq3_s_g(device const block_iq3_s * xb, short il, thread type4x4 & reg, grid_t grid) {
     // il is 0...15 for QK_K = 256 => index of block of 32 is il/2
     const float d = xb->d;
     const int ib32 = il/2;
@@ -598,22 +619,33 @@ void dequantize_iq3_s(device const block_iq3_s * xb, short il, thread type4x4 & 
     // il = 0 or 1. il = 0 processes the first 16 quants in a block of 32, il = 1 the second 16
     device const uint8_t * qs = xb->qs + 8*ib32;
     device const uint8_t * signs = xb->signs + 4*ib32 + 2*il;
-    const uint8_t qh = xb->qh[ib32] >> 4*il;
-    const float dl = d * (1 + 2*((xb->scales[ib32/2] >> 4*(ib32%2)) & 0xf));
-    uint32_t g1 = iq3s_grid[qs[4*il+0] | ((qh << 8) & 256)];
-    uint32_t g2 = iq3s_grid[qs[4*il+1] | ((qh << 7) & 256)];
+    const uint8_t qh = il ? xb->qh[ib32] >> 4 : xb->qh[ib32];
+    const uint8_t sc = xb->scales[ib32/2];
+    const float dl = d * (1 + 2*(ib32 & 1 ? sc >> 4 : sc & 0xf));
     const uint32_t s0 = signs[0];
     const uint32_t s1 = signs[1];
+    // sign by negation rather than a +-1 multiply: same values
+    float4 v1 = dl * iq_grid4(grid, qs[4*il+0] | ((qh << 8) & 256));
+    float4 v2 = dl * iq_grid4(grid, qs[4*il+1] | ((qh << 7) & 256));
+    v1 = select(v1, -v1, (uint4(s0) & uint4(0x01, 0x02, 0x04, 0x08)) != 0);
+    v2 = select(v2, -v2, (uint4(s0) & uint4(0x10, 0x20, 0x40, 0x80)) != 0);
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        reg[0][i] = dl * ((g1 >> 8*i) & 0xFF) * select(1, -1, (int) (s0 & (1u << (i+0))));
-        reg[1][i] = dl * ((g2 >> 8*i) & 0xFF) * select(1, -1, (int) (s0 & (1u << (i+4))));
+        reg[0][i] = v1[i];
+        reg[1][i] = v2[i];
     }
-    g1 = iq3s_grid[qs[4*il+2] | ((qh << 6) & 256)];
-    g2 = iq3s_grid[qs[4*il+3] | ((qh << 5) & 256)];
+    v1 = dl * iq_grid4(grid, qs[4*il+2] | ((qh << 6) & 256));
+    v2 = dl * iq_grid4(grid, qs[4*il+3] | ((qh << 5) & 256));
+    v1 = select(v1, -v1, (uint4(s1) & uint4(0x01, 0x02, 0x04, 0x08)) != 0);
+    v2 = select(v2, -v2, (uint4(s1) & uint4(0x10, 0x20, 0x40, 0x80)) != 0);
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        reg[2][i] = dl * ((g1 >> 8*i) & 0xFF) * select(1, -1, (int) (s1 & (1u << (i+0))));
-        reg[3][i] = dl * ((g2 >> 8*i) & 0xFF) * select(1, -1, (int) (s1 & (1u << (i+4))));
+        reg[2][i] = v1[i];
+        reg[3][i] = v2[i];
     }
+}
+
+template <typename type4x4>
+void dequantize_iq3_s(device const block_iq3_s * xb, short il, thread type4x4 & reg) {
+    dequantize_iq3_s_g(xb, il, reg, iq3s_grid);
 }
 
 template <typename type4x4>

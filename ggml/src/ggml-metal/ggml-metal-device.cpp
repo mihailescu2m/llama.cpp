@@ -1280,7 +1280,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 8192;
+    // IQ3_S keeps a 4 KB half4 grid past the 6 KB of A and B tiles
+    res.smem = tsrc0 == GGML_TYPE_IQ3_S ? 10240 : 8192;
 
     return res;
 }

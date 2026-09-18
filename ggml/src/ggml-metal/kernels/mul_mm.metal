@@ -536,6 +536,28 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
 
+// kernel_mul_mm_id dequantizes IQ3 blocks through its threadgroup copy of the grid, other types as usual
+template <typename block_q, typename S0_4x4, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &)>
+struct mm_id_dequantizer {
+    static void run(device const block_q * x, short il, thread S0_4x4 & reg, threadgroup const uint32_t *) {
+        dequantize_func(x, il, reg);
+    }
+};
+
+template <void (*dequantize_func)(device const block_iq3_s *, short, thread half4x4 &)>
+struct mm_id_dequantizer<block_iq3_s, half4x4, dequantize_func> {
+    static void run(device const block_iq3_s * x, short il, thread half4x4 & reg, threadgroup const uint32_t * sgrid) {
+        dequantize_iq3_s_g(x, il, reg, (threadgroup const half4 *) sgrid);
+    }
+};
+
+template <void (*dequantize_func)(device const block_iq3_xxs *, short, thread half4x4 &)>
+struct mm_id_dequantizer<block_iq3_xxs, half4x4, dequantize_func> {
+    static void run(device const block_iq3_xxs * x, short il, thread half4x4 & reg, threadgroup const uint32_t * sgrid) {
+        dequantize_iq3_xxs_g(x, il, reg, (threadgroup const half4 *) sgrid);
+    }
+};
+
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(
         constant ggml_metal_kargs_mul_mm_id & args,
@@ -667,6 +689,23 @@ kernel void kernel_mul_mm_id(
     auto cT1 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
 #endif
 
+    // IQ3 grids in threadgroup memory: its last 2 KB are unused until the output staging after the
+    // k-loop, and threadgroup reads beat divergent constant-memory lookups (same values: bit-identical)
+    threadgroup uint32_t * sgrid = (threadgroup uint32_t *)(shmem + 6144);
+    if (is_same<block_q, block_iq3_s>::value) {
+        // 512 entries pre-expanded to half4: 4 KB, so these pipelines get 10 KB of threadgroup memory
+        for (short i = tiitg; i < 512; i += 128) {
+            ((threadgroup half4 *) sgrid)[i] = half4(as_type<uchar4>(iq3s_grid[i]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if (is_same<block_q, block_iq3_xxs>::value) {
+        // pre-expanded to half4 (exact: small integers), which saves unpacking the bytes per use
+        for (short i = tiitg; i < 256; i += 128) {
+            ((threadgroup half4 *) sgrid)[i] = half4(as_type<uchar4>(iq3xxs_grid[i]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
 #ifndef GGML_METAL_HAS_TENSOR
         // load data and store to threadgroup memory
@@ -689,7 +728,7 @@ kernel void kernel_mul_mm_id(
             }
         } else {
             S0_4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            mm_id_dequantizer<block_q, S0_4x4, dequantize_func>::run(x, il, temp_a, sgrid);
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -757,7 +796,7 @@ kernel void kernel_mul_mm_id(
             }
         } else {
             S0_4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            mm_id_dequantizer<block_q, S0_4x4, dequantize_func>::run(x, il, temp_a, sgrid);
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
