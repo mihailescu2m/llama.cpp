@@ -9,6 +9,7 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax    [[function_constant(FC_MUL_MM + 6)]];
 constant bool FC_mul_mm_id_compact [[function_constant(FC_MUL_MM + 7)]];
+constant bool FC_mul_mm_id_lo8     [[function_constant(FC_MUL_MM + 8)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -647,6 +648,10 @@ kernel void kernel_mul_mm_id(
 
     // simdgroups 2,3 own rows NR1H..NR1-1
     const bool sg_active = has_hi || sgitg < 2;
+
+    // sparse-routing variant (FC_mul_mm_id_lo8): a tile of at most 8 tokens gives each simdgroup 16
+    // rows of the first 8-token block instead; the plain variant compiles this path out
+    const bool lo8 = FC_mul_mm_id_lo8 && nr1 <= NR1H/2;
 #else
     auto tA  = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
 
@@ -802,7 +807,32 @@ kernel void kernel_mul_mm_id(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
 #ifndef GGML_METAL_HAS_TENSOR
-        if (sg_active) {
+        if (lo8) {
+            // all four simdgroups work and no MMA is spent on empty tokens; every output is still the
+            // same MMA chain, so bit-identical
+            threadgroup const S0 * lsma = (sa + 2*64*sgitg);
+            threadgroup const S1 * lsmb = sb;
+
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_load(ma[0], lsma,      8, 0, false);
+                simdgroup_load(ma[1], lsma + 64, 8, 0, false);
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_load(mb[0], lsmb, 8, 0, false);
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++){
+                    simdgroup_multiply_accumulate(mc[i], mb[0], ma[i], mc[i]);
+                }
+
+                lsma += 8*64;
+                lsmb += 4*64;
+            }
+        } else if (sg_active) {
             // load matrices from threadgroup memory and conduct outer products
             threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
             threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
@@ -856,7 +886,13 @@ kernel void kernel_mul_mm_id(
         cT1.store(tC1);
     }
 #else
-    if (sg_active) {
+    if (lo8) {
+        // rows 16*sgitg.., tokens 0..7
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 16*sgitg;
+
+        simdgroup_store(mc[0], temp_str,     NR0, 0, false);
+        simdgroup_store(mc[1], temp_str + 8, NR0, 0, false);
+    } else if (sg_active) {
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
         for (short i = 0; i < 8; i++) {

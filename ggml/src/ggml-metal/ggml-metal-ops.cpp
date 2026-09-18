@@ -2874,7 +2874,12 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         }
 
         {
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, compact);
+            // sparse routing (at most 8 tokens per expert on average, as in decode-width ubatches) takes
+            // the variant whose small tiles use all four simdgroups; dense calls keep the plain kernel,
+            // which that extra path slows by 1-2.5%. Both are bit-identical
+            const bool lo8 = ne20*ne21 <= 8*ne02;
+
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, compact, lo8);
 
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
