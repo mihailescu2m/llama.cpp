@@ -12,6 +12,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <limits.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -916,6 +917,7 @@ struct ggml_metal_rsets {
 
     // number of seconds since the last graph computation
     // keep the residency sets wired for that amount of time to avoid being collected by the OS
+    // 0 = keep them wired for as long as the process runs
     int keep_alive_s;
     int loops_per_s;
     int time_per_loop_ms;
@@ -958,25 +960,37 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     res->lock = [[NSLock alloc] init];
     res->data = [[NSMutableArray alloc] init];
 
-    // by default keep the memory wired for 3 minutes
-    res->keep_alive_s = 3*60;
+    // by default keep the memory wired for as long as the process runs: once unwired, a model that
+    // fills the machine is compressed or swapped by the first memory pressure, and the next request
+    // stalls while it is faulted back. GGML_METAL_RESIDENCY_KEEP_ALIVE_S=N > 0 releases it after N
+    // idle seconds instead (upstream: 180).
+    res->keep_alive_s = 0;
 
     const char * GGML_METAL_RESIDENCY_KEEP_ALIVE_S = getenv("GGML_METAL_RESIDENCY_KEEP_ALIVE_S");
     if (GGML_METAL_RESIDENCY_KEEP_ALIVE_S) {
         res->keep_alive_s = atoi(GGML_METAL_RESIDENCY_KEEP_ALIVE_S);
     }
 
-    if (res->keep_alive_s <= 0) {
-        res->keep_alive_s = 3*60;
-    }
-
     res->time_per_loop_ms = 5;
     res->loops_per_s = 1000/res->time_per_loop_ms;
 
-    GGML_LOG_INFO("%s: creating a residency set collection (keep_alive = %d s)\n", __func__, res->keep_alive_s);
+    if (res->keep_alive_s < 0) {
+        res->keep_alive_s = 0;
+    }
+
+    // d_loop counts heartbeats
+    if (res->keep_alive_s > INT_MAX/res->loops_per_s) {
+        res->keep_alive_s = INT_MAX/res->loops_per_s;
+    }
+
+    if (res->keep_alive_s == 0) {
+        GGML_LOG_INFO("%s: creating a residency set collection (keep_alive = while running)\n", __func__);
+    } else {
+        GGML_LOG_INFO("%s: creating a residency set collection (keep_alive = %d s)\n", __func__, res->keep_alive_s);
+    }
 
     atomic_store_explicit(&res->d_stop, false, memory_order_relaxed);
-    atomic_store_explicit(&res->d_loop, res->loops_per_s*res->keep_alive_s, memory_order_relaxed);
+    atomic_store_explicit(&res->d_loop, res->keep_alive_s == 0 ? 1 : res->loops_per_s*res->keep_alive_s, memory_order_relaxed);
 
     res->d_group = dispatch_group_create();
 
@@ -994,7 +1008,9 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
                           [res->data[i] requestResidency];
                       }
 
-                      atomic_fetch_sub_explicit(&res->d_loop, 1, memory_order_relaxed);
+                      if (res->keep_alive_s > 0) {
+                          atomic_fetch_sub_explicit(&res->d_loop, 1, memory_order_relaxed);
+                      }
 
                       [res->lock unlock];
                   }
@@ -1425,6 +1441,10 @@ void ggml_metal_device_rsets_rm(ggml_metal_device_t dev, ggml_metal_rset_t rset)
 
 void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
     if (dev->rsets == NULL) {
+        return;
+    }
+
+    if (dev->rsets->keep_alive_s == 0) {
         return;
     }
 
