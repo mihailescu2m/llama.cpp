@@ -1993,6 +1993,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_sparse_hr(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op,
+        int32_t nsg) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    char name[256];
+
+    snprintf(name, 256, "kernel_flash_attn_ext_sparse_hr_d%d_nsg%d", (int) op->src[1]->ne[0], nsg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
         ggml_metal_library_t lib,
         const ggml_tensor * op,

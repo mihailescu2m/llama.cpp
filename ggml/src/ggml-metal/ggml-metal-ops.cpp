@@ -3107,6 +3107,62 @@ static int ggml_metal_op_flash_attn_ext_nqptg(const ggml_tensor * op) {
     return 2*OP_FLASH_ATTN_EXT_NQPSG;
 }
 
+// sparse prefill with the query heads as the matrix rows (kernel_flash_attn_ext_sparse_hr):
+// needs one index list per query row shared by the heads, F16 K/V with DK == DV, and G <= 16
+static bool ggml_metal_op_flash_attn_ext_sparse_hr_shape(const ggml_tensor * op) {
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * v    = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+
+    float max_bias;
+    float logit_softcap;
+    memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(float));
+    memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(float));
+
+    if (op->src[4] || max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || q->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (k->ne[0] != v->ne[0] || (k->ne[0] != 128 && k->ne[0] != 256) || q->ne[0] != k->ne[0]) {
+        return false;
+    }
+
+    if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t)) {
+        return false;
+    }
+
+    // one index list per query row: the mask must not vary across heads
+    if (!mask || mask->ne[2] != 1) {
+        return false;
+    }
+
+    if (k->ne[2] != v->ne[2] || q->ne[2] % k->ne[2] != 0 || q->ne[2]/k->ne[2] > 16) {
+        return false;
+    }
+
+    // prefill-width batches: decode keeps the split-KV vec kernel
+    return q->ne[1] >= 32;
+}
+
+// on by default; GGML_METAL_FA_SPARSE_HR=0 falls back to the vec kernel
+static bool ggml_metal_op_flash_attn_ext_sparse_hr_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_METAL_FA_SPARSE_HR");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    return enabled;
+}
+
+static bool ggml_metal_op_flash_attn_ext_use_sparse_hr(const ggml_tensor * op) {
+    return ggml_metal_op_flash_attn_ext_sparse_hr_enabled() && ggml_metal_op_flash_attn_ext_sparse_hr_shape(op);
+}
+
 // returns the n_kv_max hint if the sparse path is available for this op, or 0 otherwise
 // the mask (src[3]) remains the single source of truth: finite entries are the valid KV positions,
 // n_kv_max is only an upper bound on their number per mask row, used to size the index lists
@@ -3162,6 +3218,17 @@ static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) 
             break;
         default:
             return 0;
+    }
+
+    // GQA prefill: the dense kernel wins until the KV range is several times the selection, since
+    // the sparse kernels pay for the gather. Crossovers measured on M1 Max with top_k = 2048:
+    // heads-as-rows kernel between 2x and 5x, vec kernel between 9x and 17x.
+    if (ggml_metal_op_flash_attn_ext_sparse_hr_shape(op)) {
+        const int64_t min_ratio = ggml_metal_op_flash_attn_ext_sparse_hr_enabled() ? 3 : 12;
+
+        if (op->src[1]->ne[1] < min_ratio*n_kv_max) {
+            return 0;
+        }
     }
 
     return n_kv_max;
@@ -3814,6 +3881,71 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         if (need_sync) {
             ggml_metal_op_concurrency_reset(ctx);
+        }
+
+        if (use_sparse && ggml_metal_op_flash_attn_ext_use_sparse_hr(op)) {
+            ggml_metal_kargs_flash_attn_ext_vec args = {
+                /*.ne01          =*/ ne01,
+                /*.ne02          =*/ ne02,
+                /*.ne03          =*/ ne03,
+                /*.nb01          =*/ nb01,
+                /*.nb02          =*/ nb02,
+                /*.nb03          =*/ nb03,
+                /*.ne11          =*/ n_kv_max_padded,
+                /*.ne_12_2       =*/ ne12,
+                /*.ne_12_3       =*/ ne13,
+                /*.ns10          =*/ (int32_t) (nb11_attn/nb10_attn),
+                /*.nb11          =*/ nb11_attn,
+                /*.nb12          =*/ nb12_attn,
+                /*.nb13          =*/ nb13_attn,
+                /*.ns20          =*/ (int32_t) (nb21_attn/nb20_attn),
+                /*.nb21          =*/ nb21_attn,
+                /*.nb22          =*/ nb22_attn,
+                /*.nb23          =*/ nb23_attn,
+                /*.ne31          =*/ ne31,
+                /*.ne32          =*/ ne32,
+                /*.ne33          =*/ ne33,
+                /*.nb31          =*/ nb31,
+                /*.nb32          =*/ nb32,
+                /*.nb33          =*/ nb33,
+                /*.ne1           =*/ ne1,
+                /*.ne2           =*/ ne2,
+                /*.ne3           =*/ ne3,
+                /*.scale         =*/ scale,
+                /*.max_bias      =*/ 0.0f,
+                /*.m0            =*/ 0.0f,
+                /*.m1            =*/ 0.0f,
+                /*.n_head_log2   =*/ 0,
+                /*.logit_softcap =*/ 0.0f,
+                /*.n_kv_max_padded =*/ n_kv_max_padded,
+            };
+
+            static const int nsg = [] {
+                const char * e = getenv("GGML_METAL_FA_SPARSE_HR_NSG");
+                return e && atoi(e) == 4 ? 4 : 8;
+            }();
+
+            auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_sparse_hr(lib, op, nsg);
+
+            const int32_t dk = (int32_t) ne00;
+
+            // keep in sync with the kernel's threadgroup layout (R = 16, C = 32)
+            const size_t smem = GGML_PAD(16*dk*2 + 32*dk*2 + 16*32*4 + 2*64*4 + 16*4 + 32*4 + 32*2, 16);
+            GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_k,    2);
+            ggml_metal_encoder_set_buffer  (enc, bid_v,    3);
+            ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+            ggml_metal_encoder_set_buffer  (enc, bid_idx,  5);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  6);
+
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne12, ne03, 32, nsg, 1);
+
+            return 1;
         }
 
         // note: for simplicity assume the K is larger or equal than V

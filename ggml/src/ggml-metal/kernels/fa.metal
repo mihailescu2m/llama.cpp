@@ -2519,6 +2519,267 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 #undef DV
 }
 
+// Sparse flash attention with the heads as the matrix rows: one threadgroup per (query row, KV head).
+// The G query heads that share a KV head form the rows of the Q tile, so each gathered K/V row is
+// loaded once for all G heads and the products run on simdgroup matrices. Walks the index lists
+// built by kernel_flash_attn_ext_vec_idx (ascending, -1 padded). F16 K/V, DK == DV == D, G <= 16,
+// mask shared by all heads.
+template<short D, short NSG>
+kernel void kernel_flash_attn_ext_sparse_hr(
+        constant ggml_metal_kargs_flash_attn_ext_vec & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const int  * idx,
+        device       char * dst,
+        threadgroup  half * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NT  = NSG*N_SIMDWIDTH;
+    constexpr short R   = 16;     // Q rows (heads), two 8-row blocks
+    constexpr short RS  = R/NSG;  // softmax rows per simdgroup
+    constexpr short C   = 32;     // gathered cells per step
+    constexpr short DS  = D/NSG;  // O columns per simdgroup
+    constexpr short NO  = DS/8;
+
+    const int iq1 = tgpig[0];
+    const int ikv = tgpig[1];
+    const int iq3 = tgpig[2];
+
+    const int G    = args.ne02/args.ne_12_2;
+    const int ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+    threadgroup half  * sq    = shmem;                                 // [R][D]
+    threadgroup half  * sk    = sq + R*D;                              // [C][D] K, then V
+    threadgroup float * ss    = (threadgroup float *) (sk + C*D);      // [R][C] scores, then P
+    threadgroup float * sdiag = ss + R*C;                              // [2][8][8] rescale diagonals
+    threadgroup float * sms   = sdiag + 2*64;                          // [R] rescale factors, then sums
+    threadgroup int   * sid   = (threadgroup int *) (sms + R);         // [C] cell ids
+    threadgroup half  * smk   = (threadgroup half *) (sid + C);        // [C] mask values
+
+    device const int  * pidx = idx + (((int64_t) (iq3%args.ne33)*args.ne32)*args.ne31 + iq1)*args.n_kv_max_padded;
+    device const half * pm   = (device const half *) (mask + iq1*args.nb31 + (iq3%args.ne33)*args.nb33);
+
+    device const char * kb = k + ikv*args.nb12 + ikv3*args.nb13;
+    device const char * vb = v + ikv*args.nb22 + ikv3*args.nb23;
+
+    for (int i = tiitg; i < R*D/4; i += NT) {
+        const int r  = i/(D/4);
+        const int c4 = i%(D/4);
+
+        half4 val = 0;
+        if (r < G) {
+            device const float4 * q4 = (device const float4 *) (q + iq1*args.nb01 + (ikv*G + r)*args.nb02 + iq3*args.nb03);
+            val = (half4) q4[c4];
+        }
+        ((threadgroup half4 *) sq)[i] = val;
+    }
+
+    for (int i = tiitg; i < 2*64; i += NT) {
+        sdiag[i] = 0.0f;
+    }
+
+    float Mr[RS];
+    float Sr[RS];
+    for (short jj = 0; jj < RS; ++jj) {
+        Mr[jj] = -FLT_MAX/2;
+        Sr[jj] = 0.0f;
+    }
+
+    simdgroup_float8x8 lo[2][NO];
+    for (short ii = 0; ii < NO; ++ii) {
+        lo[0][ii] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        lo[1][ii] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (int j0 = 0; j0 < args.n_kv_max_padded; j0 += C) {
+        if (tiitg < C) {
+            const int id = pidx[j0 + tiitg];
+            sid[tiitg] = id;
+            smk[tiitg] = id >= 0 ? pm[id] : (half) -MAXHALF;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // the lists are ascending with the -1 padding at the tail
+        if (sid[0] < 0) {
+            break;
+        }
+
+        for (int i = tiitg; i < C*D/8; i += NT) {
+            const int c  = i/(D/8);
+            const int d8 = i%(D/8);
+            const int id = sid[c];
+
+            uint4 val = 0;
+            if (id >= 0) {
+                val = ((device const uint4 *) (kb + (uint64_t) id*args.nb11))[d8];
+            }
+            ((threadgroup uint4 *) sk)[i] = val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S = Q*K^T: with 4 simdgroups, simdgroup sgitg owns the cells [8*sgitg, 8*sgitg + 8) for
+        // both row blocks; with 8, it owns one (row block, cell tile) pair
+        if (NSG == 4) {
+            simdgroup_float8x8 mqk[2] = {
+                make_filled_simdgroup_matrix<float, 8>(0.0f),
+                make_filled_simdgroup_matrix<float, 8>(0.0f),
+            };
+
+            #pragma unroll (4)
+            for (short i = 0; i < D/8; ++i) {
+                simdgroup_half8x8 mk;
+                simdgroup_half8x8 mq0;
+                simdgroup_half8x8 mq1;
+
+                simdgroup_load(mk,  sk + (8*sgitg)*D + 8*i, D, 0, true);
+                simdgroup_load(mq0, sq + 0*8*D + 8*i, D);
+                simdgroup_load(mq1, sq + 1*8*D + 8*i, D);
+
+                simdgroup_multiply_accumulate(mqk[0], mq0, mk, mqk[0]);
+                simdgroup_multiply_accumulate(mqk[1], mq1, mk, mqk[1]);
+            }
+
+            simdgroup_store(mqk[0], ss + 0*8*C + 8*sgitg, C, 0, false);
+            simdgroup_store(mqk[1], ss + 1*8*C + 8*sgitg, C, 0, false);
+        } else {
+            const short rb = sgitg/4;
+            const short ct = sgitg%4;
+
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+            #pragma unroll (4)
+            for (short i = 0; i < D/8; ++i) {
+                simdgroup_half8x8 mk;
+                simdgroup_half8x8 mq;
+
+                simdgroup_load(mk, sk + (8*ct)*D + 8*i, D, 0, true);
+                simdgroup_load(mq, sq + rb*8*D + 8*i, D);
+
+                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+            }
+
+            simdgroup_store(mqk, ss + rb*8*C + 8*ct, C, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // stage V over K while the online softmax runs
+        for (int i = tiitg; i < C*D/8; i += NT) {
+            const int c  = i/(D/8);
+            const int d8 = i%(D/8);
+            const int id = sid[c];
+
+            uint4 val = 0;
+            if (id >= 0) {
+                val = ((device const uint4 *) (vb + (uint64_t) id*args.nb21))[d8];
+            }
+            ((threadgroup uint4 *) sk)[i] = val;
+        }
+
+        for (short jj = 0; jj < RS; ++jj) {
+            const short j = sgitg*RS + jj;
+
+            const float s = ss[j*C + tiisg]*args.scale + (float) smk[tiisg];
+            const float m = Mr[jj];
+
+            Mr[jj] = simd_max(max(m, s));
+
+            const float ms = exp(m - Mr[jj]);
+            const float p  = exp(s - Mr[jj]);
+
+            Sr[jj] = Sr[jj]*ms + simd_sum(p);
+
+            ss[j*C + tiisg] = p;
+
+            if (tiisg == 0) {
+                sms[j] = ms;
+                sdiag[(j/8)*64 + (j%8)*9] = ms;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bool rescale = false;
+        for (short j = 0; j < R; ++j) {
+            rescale |= sms[j] != 1.0f;
+        }
+
+        if (rescale) {
+            simdgroup_float8x8 md0;
+            simdgroup_float8x8 md1;
+
+            simdgroup_load(md0, sdiag + 0,  8);
+            simdgroup_load(md1, sdiag + 64, 8);
+
+            for (short ii = 0; ii < NO; ++ii) {
+                simdgroup_multiply(lo[0][ii], md0, lo[0][ii]);
+                simdgroup_multiply(lo[1][ii], md1, lo[1][ii]);
+            }
+        }
+
+        // O = O + P*V: simdgroup sgitg owns the columns [DS*sgitg, DS*sgitg + DS)
+        FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+            simdgroup_float8x8 vs0;
+            simdgroup_float8x8 vs1;
+
+            simdgroup_load(vs0, ss + 0*8*C + 8*cc, C);
+            simdgroup_load(vs1, ss + 1*8*C + 8*cc, C);
+
+            FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+                simdgroup_half8x8 mv;
+
+                simdgroup_load(mv, sk + (8*cc)*D + DS*sgitg + 8*ii, D);
+
+                simdgroup_multiply_accumulate(lo[0][ii], vs0, mv, lo[0][ii]);
+                simdgroup_multiply_accumulate(lo[1][ii], vs1, mv, lo[1][ii]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // the K/V staging area holds R*D floats exactly
+    threadgroup float * so = (threadgroup float *) sk;
+
+    for (short ii = 0; ii < NO; ++ii) {
+        simdgroup_store(lo[0][ii], so + 0*8*D + DS*sgitg + 8*ii, D);
+        simdgroup_store(lo[1][ii], so + 1*8*D + DS*sgitg + 8*ii, D);
+    }
+
+    if (tiisg == 0) {
+        for (short jj = 0; jj < RS; ++jj) {
+            sms[sgitg*RS + jj] = Sr[jj];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = tiitg; i < G*D/4; i += NT) {
+        const int r  = i/(D/4);
+        const int c4 = i%(D/4);
+
+        const float s     = sms[r];
+        const float scale = s == 0.0f ? 0.0f : 1.0f/s;
+
+        device float4 * dst4 = (device float4 *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + (ikv*G + r) + (uint64_t) iq1*args.ne1)*(D/4);
+
+        dst4[c4] = ((threadgroup float4 *) so)[r*(D/4) + c4]*scale;
+    }
+}
+
+typedef decltype(kernel_flash_attn_ext_sparse_hr<128, 4>) flash_attn_ext_sparse_hr_t;
+
+template [[host_name("kernel_flash_attn_ext_sparse_hr_d128_nsg4")]] kernel flash_attn_ext_sparse_hr_t kernel_flash_attn_ext_sparse_hr<128, 4>;
+template [[host_name("kernel_flash_attn_ext_sparse_hr_d256_nsg4")]] kernel flash_attn_ext_sparse_hr_t kernel_flash_attn_ext_sparse_hr<256, 4>;
+template [[host_name("kernel_flash_attn_ext_sparse_hr_d128_nsg8")]] kernel flash_attn_ext_sparse_hr_t kernel_flash_attn_ext_sparse_hr<128, 8>;
+template [[host_name("kernel_flash_attn_ext_sparse_hr_d256_nsg8")]] kernel flash_attn_ext_sparse_hr_t kernel_flash_attn_ext_sparse_hr<256, 8>;
+
 template<
     typename kd4x4_t,
     short nl_k,
